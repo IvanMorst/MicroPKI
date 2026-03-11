@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='micropki',
-    version='0.1.0',
+    version='0.2.0',  # Updated for Sprint 2
     packages=find_packages(),
     include_package_data=True,
     install_requires=[

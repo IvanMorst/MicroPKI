@@ -1,13 +1,12 @@
+import os
 import re
 import logging
-import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple
+from typing import Optional
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa, ec
-
 
 def parse_dn(dn_string: str) -> x509.Name:
     """Parse DN in slash or comma format into an x509.Name."""
@@ -20,96 +19,11 @@ def parse_dn(dn_string: str) -> x509.Name:
                 raise ValueError(f"Invalid DN part: {part}")
             key, value = part.split('=', 1)
             oid = _attr_key_to_oid(key.strip())
-            # Unescape any escaped characters
-            value = _unescape_dn_value(value.strip())
-            attributes.append(x509.NameAttribute(oid, value))
+            attributes.append(x509.NameAttribute(oid, value.strip()))
         return x509.Name(attributes)
     else:
-        # For comma-separated format, parse manually respecting escaped commas
-        attributes = []
-        current_key = []
-        current_value = []
-        in_key = True
-        escape = False
-        i = 0
-        length = len(dn_string)
-
-        while i < length:
-            char = dn_string[i]
-
-            if escape:
-                # If we're in escape mode, add the character as-is
-                if in_key:
-                    current_key.append(char)
-                else:
-                    current_value.append(char)
-                escape = False
-                i += 1
-                continue
-
-            if char == '\\':
-                # Start escape sequence
-                escape = True
-                i += 1
-                continue
-
-            if char == '=' and in_key:
-                # End of key, start of value
-                in_key = False
-                i += 1
-                continue
-
-            if char == ',' and not in_key:
-                # End of attribute, process it
-                key = ''.join(current_key).strip()
-                value = ''.join(current_value).strip()
-                # Unescape any escaped characters in value
-                value = _unescape_dn_value(value)
-                oid = _attr_key_to_oid(key)
-                attributes.append(x509.NameAttribute(oid, value))
-                # Reset for next attribute
-                current_key = []
-                current_value = []
-                in_key = True
-                i += 1
-                continue
-
-            # Normal character
-            if in_key:
-                current_key.append(char)
-            else:
-                current_value.append(char)
-            i += 1
-
-        # Don't forget the last attribute (if any)
-        if current_key or current_value:
-            key = ''.join(current_key).strip()
-            value = ''.join(current_value).strip()
-            # Unescape any escaped characters in value
-            value = _unescape_dn_value(value)
-            oid = _attr_key_to_oid(key)
-            attributes.append(x509.NameAttribute(oid, value))
-
-        return x509.Name(attributes)
-
-
-def _unescape_dn_value(value: str) -> str:
-    """Unescape escaped characters in a DN value."""
-    result = []
-    escape = False
-    for char in value:
-        if escape:
-            # Add the escaped character as-is (without the backslash)
-            result.append(char)
-            escape = False
-        elif char == '\\':
-            escape = True
-        else:
-            result.append(char)
-    # If there's a trailing backslash (unlikely), add it
-    if escape:
-        result.append('\\')
-    return ''.join(result)
+        # Assume RFC 4514 comma-separated
+        return x509.Name.from_rfc4514_string(dn_string)
 
 def _attr_key_to_oid(key: str) -> x509.ObjectIdentifier:
     mapping = {
@@ -137,9 +51,13 @@ def create_self_signed_cert(
 ) -> x509.Certificate:
     """Generate a self-signed X.509 CA certificate."""
     subject = issuer = subject_name
-    # Generate serial number with maximum 159 bits (20 bytes - 1 bit)
-    # Using 19 bytes gives 152 bits which is safe
-    serial = int.from_bytes(os.urandom(19), byteorder='big')
+    # Генерируем 19 байт (152 бита) для гарантии < 159 бит
+    serial_bytes = os.urandom(19)
+    serial = int.from_bytes(serial_bytes, byteorder='big')
+
+    # Убеждаемся что число положительное и не слишком большое
+    if serial.bit_length() >= 159:
+        serial = serial >> 1  # Сдвигаем чтобы уменьшить
 
     now = datetime.now(timezone.utc)
     not_before = now
@@ -154,12 +72,10 @@ def create_self_signed_cert(
     builder = builder.not_valid_after(not_after)
 
     # Extensions
-    # BasicConstraints: CA=True, no pathlen constraint
     builder = builder.add_extension(
         x509.BasicConstraints(ca=True, path_length=None),
         critical=True
     )
-    # KeyUsage: keyCertSign and cRLSign (digitalSignature optional)
     builder = builder.add_extension(
         x509.KeyUsage(
             digital_signature=True,
