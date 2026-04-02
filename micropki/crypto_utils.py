@@ -18,13 +18,10 @@ def encrypt_private_key(key: PrivateKeyTypes, passphrase: bytes) -> bytes:
         encryption_algorithm=serialization.BestAvailableEncryption(passphrase)
     )
 
-def load_encrypted_private_key(key_path: Path, passphrase: bytes) -> PrivateKeyTypes:
-    """Load an encrypted private key from PEM file."""
+def load_encrypted_private_key(key_path: Path, passphrase: bytes):
+    """Load and decrypt an encrypted private key from PEM file."""
     pem_data = key_path.read_bytes()
-    return serialization.load_pem_private_key(
-        pem_data,
-        password=passphrase
-    )
+    return serialization.load_pem_private_key(pem_data, password=passphrase)
 
 def save_pem(data: bytes, path: Path, mode: int = 0o600):
     path.write_bytes(data)
