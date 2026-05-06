@@ -57,6 +57,7 @@ def main():
     db_sub = db_init.add_subparsers(dest='db_command', required=True)
     db_init_cmd = db_sub.add_parser('init', help='Initialise database')
     db_init_cmd.add_argument('--db-path', default='./pki/micropki.db')
+    db_init_cmd.add_argument('--force', action='store_true', help='Force reinitialisation')
     db_init_cmd.add_argument('--log-file')
 
     # Sprint 3: ca list-certs
@@ -80,7 +81,38 @@ def main():
     repo_serve_cmd.add_argument('--port', type=int, default=8080)
     repo_serve_cmd.add_argument('--db-path', default='./pki/micropki.db')
     repo_serve_cmd.add_argument('--cert-dir', default='./pki/certs')
+    repo_serve_cmd.add_argument('--crl-dir', default='./pki/crl')
     repo_serve_cmd.add_argument('--log-file')
+
+    # Sprint 4: ca revoke
+    ca_revoke = subparsers.add_parser('revoke', help='Revoke a certificate')
+    ca_revoke.add_argument('serial', help='Certificate serial number in hex')
+    ca_revoke.add_argument('--reason', default='unspecified',
+                          choices=['unspecified', 'keyCompromise', 'cACompromise',
+                                  'affiliationChanged', 'superseded', 'cessationOfOperation',
+                                  'certificateHold', 'removeFromCRL', 'privilegeWithdrawn',
+                                  'aACompromise'])
+    ca_revoke.add_argument('--force', action='store_true', help='Skip confirmation')
+    ca_revoke.add_argument('--db-path', default='./pki/micropki.db')
+    ca_revoke.add_argument('--log-file')
+
+    # Sprint 4: ca gen-crl
+    ca_gencrl = subparsers.add_parser('gen-crl', help='Generate CRL for a CA')
+    ca_gencrl.add_argument('--ca', required=True, choices=['root', 'intermediate'],
+                          help='CA type (root or intermediate)')
+    ca_gencrl.add_argument('--next-update', type=int, default=7,
+                          help='Days until next CRL update (default: 7)')
+    ca_gencrl.add_argument('--out-file', help='Output file path (default: auto)')
+    ca_gencrl.add_argument('--out-dir', default='./pki', help='Output directory')
+    ca_gencrl.add_argument('--db-path', help='SQLite database path')
+    ca_gencrl.add_argument('--passphrase-file', help='Passphrase file for CA key')
+    ca_gencrl.add_argument('--log-file')
+
+    # Sprint 4: ca check-revoked (optional)
+    ca_check = subparsers.add_parser('check-revoked', help='Check certificate revocation status')
+    ca_check.add_argument('serial', help='Certificate serial number in hex')
+    ca_check.add_argument('--db-path', default='./pki/micropki.db')
+    ca_check.add_argument('--log-file')
 
     args = parser.parse_args()
     log_file = getattr(args, 'log_file', None)
@@ -99,14 +131,20 @@ def main():
             ca.issue_certificate(args)
         elif args.command == 'db' and args.db_command == 'init':
             db_path = Path(args.db_path)
-            init_db(db_path)
+            init_db(db_path, force=args.force)
             print(f"Database initialised at {db_path}")
         elif args.command == 'list-certs':
             _do_list_certs(args)
         elif args.command == 'show-cert':
             _do_show_cert(args)
         elif args.command == 'repo' and args.repo_command == 'serve':
-            serve_repository(args.host, args.port, args.db_path, args.cert_dir)
+            serve_repository(args.host, args.port, args.db_path, args.cert_dir, args.crl_dir)
+        elif args.command == 'revoke':
+            ca.revoke_certificate_cmd(args)
+        elif args.command == 'gen-crl':
+            ca.generate_crl_cmd(args)
+        elif args.command == 'check-revoked':
+            _do_check_revoked(args)
         else:
             parser.print_help()
             sys.exit(1)
@@ -172,6 +210,21 @@ def _do_show_cert(args):
         print(f"Certificate with serial {args.serial} not found")
         sys.exit(1)
     print(cert_data['cert_pem'])
+
+def _do_check_revoked(args):
+    from .revocation import validate_reason  # noqa
+    db_path = Path(args.db_path)
+    if not db_path.exists():
+        print(f"Database not found: {db_path}")
+        sys.exit(1)
+    cert_data = get_certificate_by_serial(db_path, args.serial)
+    if not cert_data:
+        print(f"Certificate with serial {args.serial} not found")
+        sys.exit(1)
+    if cert_data['status'] == 'revoked':
+        print(f"REVOKED - Reason: {cert_data['revocation_reason']}, Date: {cert_data['revocation_date']}")
+    else:
+        print("VALID")
 
 if __name__ == '__main__':
     main()

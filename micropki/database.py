@@ -20,26 +20,39 @@ CREATE TABLE IF NOT EXISTS certificates (
     revocation_date TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS crl_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ca_subject TEXT UNIQUE NOT NULL,
+    crl_number INTEGER NOT NULL,
+    last_generated TEXT NOT NULL,
+    next_update TEXT NOT NULL,
+    crl_path TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_serial_hex ON certificates(serial_hex);
 CREATE INDEX IF NOT EXISTS idx_status ON certificates(status);
+CREATE INDEX IF NOT EXISTS idx_issuer ON certificates(issuer);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ca_subject ON crl_metadata(ca_subject);
 """
 
 
-def init_db(db_path: Path):
+def init_db(db_path: Path, force: bool = False):
     """Create database schema if not exists."""
-    # Ensure directory exists
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # On Windows, NamedTemporaryFile might have issues, so we use a fixed path in temp
+    if force and db_path.exists():
+        db_path.unlink()
+
+    conn = sqlite3.connect(str(db_path))
     try:
-        conn = sqlite3.connect(str(db_path))
         conn.executescript(SCHEMA)
-        conn.commit()
-        conn.close()
         logger.info(f"Database initialised at {db_path}")
     except Exception as e:
         logger.error(f"Failed to initialise database: {e}")
         raise
+    finally:
+        conn.close()
 
 
 def get_db_connection(db_path: Path):
@@ -65,7 +78,7 @@ def insert_certificate(db_path: Path, cert_data: Dict[str, Any]):
             cert_data['created_at']
         ))
         conn.commit()
-        logger.info(f"Certificate inserted: serial={cert_data['serial_hex']}, subject={cert_data['subject']}")
+        logger.info(f"Certificate inserted: serial={cert_data['serial_hex']}")
     except sqlite3.IntegrityError as e:
         logger.error(f"Duplicate serial number: {cert_data['serial_hex']}")
         raise ValueError(f"Duplicate serial number: {cert_data['serial_hex']}") from e
@@ -90,14 +103,22 @@ def get_certificate_by_serial(db_path: Path, serial_hex: str) -> Optional[Dict[s
         conn.close()
 
 
-def list_certificates(db_path: Path, status: Optional[str] = None) -> List[Dict[str, Any]]:
-    """List certificates, optionally filtered by status."""
+def list_certificates(db_path: Path, status: Optional[str] = None, issuer: Optional[str] = None) -> List[
+    Dict[str, Any]]:
+    """List certificates, optionally filtered by status or issuer."""
     conn = get_db_connection(db_path)
     try:
+        query = "SELECT * FROM certificates WHERE 1=1"
+        params = []
         if status:
-            cursor = conn.execute("SELECT * FROM certificates WHERE status = ? ORDER BY id", (status,))
-        else:
-            cursor = conn.execute("SELECT * FROM certificates ORDER BY id")
+            query += " AND status = ?"
+            params.append(status)
+        if issuer:
+            query += " AND issuer = ?"
+            params.append(issuer)
+        query += " ORDER BY id"
+
+        cursor = conn.execute(query, params)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
         return [dict(zip(columns, row)) for row in rows]
@@ -106,7 +127,7 @@ def list_certificates(db_path: Path, status: Optional[str] = None) -> List[Dict[
 
 
 def update_certificate_status(db_path: Path, serial_hex: str, status: str, reason: Optional[str] = None):
-    """Update status and revocation info (stub for Sprint 4)."""
+    """Update status and revocation info."""
     conn = get_db_connection(db_path)
     try:
         now = datetime.now(timezone.utc).isoformat()

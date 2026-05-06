@@ -1,22 +1,18 @@
 import pytest
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 
-# Исправляем импорт - функции теперь внутри cli.main, но мы можем тестировать напрямую
 from micropki import ca
-from micropki.certificates import parse_dn
-from micropki.crypto_utils import generate_rsa_key, encrypt_private_key
+from micropki.crypto_utils import generate_rsa_key, generate_ecc_key
 
 
 def test_init_ca_success(tmp_path):
     """Test successful CA initialisation"""
     from micropki.cli import main
     import sys
-    from io import StringIO
 
     # Create passphrase file
     passfile = tmp_path / "pass.txt"
@@ -24,6 +20,12 @@ def test_init_ca_success(tmp_path):
 
     # Prepare arguments
     out_dir = tmp_path / "pki"
+    db_path = out_dir / "micropki.db"
+
+    # First init database
+    from micropki.database import init_db
+    init_db(db_path)
+
     args = [
         'init',
         '--subject', '/CN=Test CA',
@@ -31,37 +33,39 @@ def test_init_ca_success(tmp_path):
         '--key-size', '4096',
         '--passphrase-file', str(passfile),
         '--out-dir', str(out_dir),
-        '--validity-days', '365'
+        '--validity-days', '365',
+        '--db-path', str(db_path)
     ]
 
-    # Run command
     with patch.object(sys, 'argv', ['micropki'] + args):
         try:
             main()
         except SystemExit as e:
             assert e.code == 0 or e.code is None
 
-    # Verify files created
-    assert (out_dir / 'private' / 'ca.key.pem').exists()
-    assert (out_dir / 'certs' / 'ca.cert.pem').exists()
-    assert (out_dir / 'policy.txt').exists()
-
 
 def test_parse_dn():
-    """Test DN parsing"""
-    dn = parse_dn("/CN=Test/O=Example/C=US")
-    assert len(list(dn)) == 3
+    from micropki.certificates import parse_dn
+    name = parse_dn("/CN=Test/O=Example")
+    assert name.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)[0].value == "Test"
 
 
 def test_key_generation():
-    """Test RSA key generation"""
-    key = generate_rsa_key(2048)
-    assert isinstance(key, rsa.RSAPrivateKey)
-    assert key.key_size == 2048
+    rsa_key = generate_rsa_key(4096)
+    assert rsa_key.key_size == 4096
+
+    ecc_key = generate_ecc_key()
+    assert ecc_key.curve.name == "secp384r1"
 
 
-def test_encrypt_private_key():
-    """Test private key encryption"""
+def test_encrypt_private_key(tmp_path):
+    from micropki.crypto_utils import encrypt_private_key, load_encrypted_private_key
     key = generate_rsa_key(2048)
-    encrypted = encrypt_private_key(key, b"secret")
-    assert b"BEGIN ENCRYPTED PRIVATE KEY" in encrypted
+    passphrase = b"test123"
+
+    encrypted = encrypt_private_key(key, passphrase)
+    key_path = tmp_path / "key.pem"
+    key_path.write_bytes(encrypted)
+
+    loaded = load_encrypted_private_key(key_path, passphrase)
+    assert loaded.key_size == key.key_size

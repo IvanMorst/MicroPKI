@@ -2,78 +2,79 @@ import pytest
 import tempfile
 import threading
 import time
-import socket
 from pathlib import Path
 from http.client import HTTPConnection
+
+from micropki.repository import serve_repository
 from micropki.database import init_db, insert_certificate
-
-
-def find_free_port():
-    """Find a free port for testing"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
 
 
 @pytest.fixture
 def repo_server():
-    """Fixture that starts a repository server for testing"""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / 'test.db'
         cert_dir = Path(tmpdir) / 'certs'
+        crl_dir = Path(tmpdir) / 'crl'
         cert_dir.mkdir()
+        crl_dir.mkdir()
 
-        # Initialise database
         init_db(db_path)
 
-        # Insert test certificate
+        # Insert a dummy certificate
         cert_data = {
             'serial_hex': '1234567890ABCDEF',
-            'subject': 'CN=Test Certificate',
-            'issuer': 'CN=Test CA',
+            'subject': 'CN=Test',
+            'issuer': 'CN=TestCA',
             'not_before': '2025-01-01T00:00:00',
             'not_after': '2026-01-01T00:00:00',
-            'cert_pem': '-----BEGIN CERTIFICATE-----\nTESTCERT123\n-----END CERTIFICATE-----',
+            'cert_pem': '-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----',
             'status': 'valid',
             'created_at': '2025-01-01T00:00:00'
         }
         insert_certificate(db_path, cert_data)
 
-        # Create dummy CA certificates
-        (cert_dir / 'ca.cert.pem').write_text('-----BEGIN CERTIFICATE-----\nROOTCA\n-----END CERTIFICATE-----')
-        (cert_dir / 'intermediate.cert.pem').write_text(
-            '-----BEGIN CERTIFICATE-----\nINTERMEDIATE\n-----END CERTIFICATE-----')
+        # Create dummy CA certs
+        (cert_dir / 'ca.cert.pem').write_text('FAKE ROOT CERT')
+        (cert_dir / 'intermediate.cert.pem').write_text('FAKE INTERMEDIATE CERT')
 
-        # Find free port
-        port = find_free_port()
+        # Create dummy CRL
+        (crl_dir / 'intermediate.crl.pem').write_text('FAKE CRL')
 
-        # Import and start server in background thread
-        from micropki.repository import serve_repository
+        # Find a free port
+        import socket
+        sock = socket.socket()
+        sock.bind(('', 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
         server_thread = threading.Thread(
             target=serve_repository,
-            args=('127.0.0.1', port, str(db_path), str(cert_dir)),
+            args=('127.0.0.1', port, str(db_path), str(cert_dir), str(crl_dir)),
             daemon=True
         )
         server_thread.start()
+        time.sleep(0.5)  # Allow server to start
 
-        # Wait for server to start
-        time.sleep(1)
-
-        yield {'port': port, 'cert_dir': cert_dir, 'db_path': db_path}
+        yield {
+            'port': port,
+            'db_path': db_path,
+            'cert_dir': cert_dir,
+            'crl_dir': crl_dir
+        }
 
 
 def test_get_certificate_endpoint(repo_server):
     """Test GET /certificate/<serial> endpoint"""
     port = repo_server['port']
 
-    # Test retrieving certificate by serial
     conn = HTTPConnection(f'127.0.0.1:{port}')
     conn.request('GET', '/certificate/1234567890ABCDEF')
     response = conn.getresponse()
 
     assert response.status == 200
+    assert response.getheader('Content-Type') == 'application/x-pem-file'
     data = response.read().decode('utf-8')
-    assert 'TESTCERT123' in data
+    assert 'TEST' in data
     conn.close()
 
 
@@ -110,8 +111,9 @@ def test_get_ca_root_endpoint(repo_server):
     response = conn.getresponse()
 
     assert response.status == 200
+    assert response.getheader('Content-Type') == 'application/x-pem-file'
     data = response.read().decode('utf-8')
-    assert 'ROOTCA' in data
+    assert 'FAKE ROOT CERT' in data
     conn.close()
 
 
@@ -124,22 +126,22 @@ def test_get_ca_intermediate_endpoint(repo_server):
     response = conn.getresponse()
 
     assert response.status == 200
+    assert response.getheader('Content-Type') == 'application/x-pem-file'
     data = response.read().decode('utf-8')
-    assert 'INTERMEDIATE' in data
+    assert 'FAKE INTERMEDIATE CERT' in data
     conn.close()
 
 
 def test_get_crl_endpoint(repo_server):
-    """Test GET /crl endpoint returns 501"""
+    """Test GET /crl endpoint"""
     port = repo_server['port']
 
     conn = HTTPConnection(f'127.0.0.1:{port}')
     conn.request('GET', '/crl')
     response = conn.getresponse()
 
-    assert response.status == 501
-    data = response.read().decode('utf-8')
-    assert 'not yet implemented' in data.lower()
+    assert response.status == 200
+    assert response.getheader('Content-Type') == 'application/pkix-crl'
     conn.close()
 
 

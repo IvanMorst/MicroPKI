@@ -11,10 +11,13 @@ from . import crypto_utils
 from . import certificates
 from . import csr as csr_module
 from . import templates
-from .database import insert_certificate
+from .database import insert_certificate, get_certificate_by_serial, list_certificates
 from .serial import generate_serial, serial_to_hex
+from .revocation import revoke_certificate, validate_reason
+from .crl import generate_crl
 
 logger = logging.getLogger(__name__)
+
 
 def init_ca(args):
     """Initialize self-signed Root CA (Sprint 1) with optional DB insertion."""
@@ -41,7 +44,6 @@ def init_ca(args):
 
     subject = certificates.parse_dn(args.subject)
 
-    # Generate serial using DB if available
     db_path = Path(args.db_path) if hasattr(args, 'db_path') and args.db_path else out_dir / 'micropki.db'
     if db_path.exists():
         serial_int = generate_serial(db_path)
@@ -87,7 +89,6 @@ def init_ca(args):
     cert_path.write_bytes(cert_pem)
     logger.info(f"Certificate saved to {cert_path}")
 
-    # Insert into database if exists
     if db_path.exists():
         cert_data = {
             'serial_hex': serial_hex,
@@ -101,12 +102,12 @@ def init_ca(args):
         }
         insert_certificate(db_path, cert_data)
 
-    # Write policy.txt
     policy_path = out_dir / 'policy.txt'
     policy_path.write_text(_policy_content(cert, args))
     logger.info(f"Policy document saved to {policy_path}")
 
     logger.info("Root CA initialisation successful")
+
 
 def _policy_content(cert, args):
     return f"""Certificate Policy for MicroPKI Root CA
@@ -122,6 +123,7 @@ Policy Version: 1.0
 Creation Date: {datetime.now(timezone.utc).isoformat()}
 """
 
+
 def issue_intermediate(args):
     """Create and sign an Intermediate CA certificate."""
     out_dir = Path(args.out_dir).resolve()
@@ -132,12 +134,10 @@ def issue_intermediate(args):
     certs_dir.mkdir(parents=True, exist_ok=True)
     csrs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load Root CA
     root_cert = x509.load_pem_x509_certificate(Path(args.root_cert).read_bytes())
     root_pass = crypto_utils.load_passphrase(Path(args.root_pass_file))
     root_key = crypto_utils.load_encrypted_private_key(Path(args.root_key), root_pass)
 
-    # Generate Intermediate key
     if args.key_type == 'rsa':
         inter_key = crypto_utils.generate_rsa_key(args.key_size)
     else:
@@ -150,17 +150,14 @@ def issue_intermediate(args):
 
     subject = certificates.parse_dn(args.subject)
 
-    # Database path
     db_path = Path(args.db_path) if hasattr(args, 'db_path') and args.db_path else out_dir / 'micropki.db'
     if not db_path.exists():
         raise RuntimeError(f"Database {db_path} does not exist. Run 'micropki db init' first.")
 
-    # Generate unique serial
     serial_int = generate_serial(db_path)
     serial_hex = serial_to_hex(serial_int)
-
-    # Build certificate
     now = datetime.now(timezone.utc)
+
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(root_cert.subject)
@@ -195,12 +192,10 @@ def issue_intermediate(args):
     hash_algo = hashes.SHA256() if args.key_type == 'rsa' else hashes.SHA384()
     inter_cert = builder.sign(private_key=root_key, algorithm=hash_algo)
 
-    # Save certificate
     inter_cert_path = certs_dir / 'intermediate.cert.pem'
     inter_cert_pem = inter_cert.public_bytes(serialization.Encoding.PEM)
     inter_cert_path.write_bytes(inter_cert_pem)
 
-    # Insert into database
     cert_data = {
         'serial_hex': serial_hex,
         'subject': subject.rfc4514_string(),
@@ -213,7 +208,6 @@ def issue_intermediate(args):
     }
     insert_certificate(db_path, cert_data)
 
-    # Update policy.txt
     policy_path = out_dir / 'policy.txt'
     with open(policy_path, 'a') as f:
         f.write(f"""
@@ -231,6 +225,7 @@ Creation Date: {now.isoformat()}
 """)
 
     logger.info(f"Intermediate CA certificate saved to {inter_cert_path}")
+
 
 def issue_certificate(args):
     """Issue an end-entity certificate."""
@@ -251,11 +246,9 @@ def issue_certificate(args):
     if args.template == 'server' and not san_entries:
         raise ValueError("Server certificate requires at least one SAN (DNS or IP)")
 
-    # Generate end-entity key
-    ee_key = crypto_utils.generate_rsa_key(2048)  # fixed RSA 2048 for simplicity
+    ee_key = crypto_utils.generate_rsa_key(2048)
     subject = certificates.parse_dn(args.subject)
 
-    # Database path
     out_dir = Path(args.out_dir).resolve()
     db_path = Path(args.db_path) if hasattr(args, 'db_path') and args.db_path else out_dir.parent / 'micropki.db'
     if not db_path.exists():
@@ -289,7 +282,6 @@ def issue_certificate(args):
 
     ee_cert = builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
 
-    # Save certificate and key
     out_dir.mkdir(parents=True, exist_ok=True)
     cn = _get_common_name(subject)
     if not cn:
@@ -307,7 +299,6 @@ def issue_certificate(args):
     )
     crypto_utils.save_pem(key_pem, key_path, mode=0o600)
 
-    # Insert into database
     cert_data = {
         'serial_hex': serial_hex,
         'subject': subject.rfc4514_string(),
@@ -325,6 +316,74 @@ def issue_certificate(args):
     logger.info(f"  Serial: {serial_hex}")
     logger.info(f"  SANs: {args.san if args.san else 'None'}")
     logger.warning(f"Private key saved UNENCRYPTED to {key_path}")
+
+
+def revoke_certificate_cmd(args):
+    """Execute certificate revocation command."""
+    db_path = Path(args.db_path) if args.db_path else Path('./pki/micropki.db')
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+
+    success = revoke_certificate(db_path, args.serial, args.reason, args.force)
+    if success:
+        logger.info(f"Certificate {args.serial} revoked successfully")
+
+
+def generate_crl_cmd(args):
+    """Execute CRL generation command."""
+    out_dir = Path(args.out_dir) if hasattr(args, 'out_dir') else Path('./pki')
+    db_path = Path(args.db_path) if args.db_path else out_dir / 'micropki.db'
+    crl_dir = out_dir / 'crl'
+    crl_dir.mkdir(parents=True, exist_ok=True)
+
+    if not db_path.exists():
+        raise FileNotFoundError(f"Database not found: {db_path}")
+
+    # Determine CA type and paths
+    if args.ca == 'root':
+        ca_cert_path = out_dir / 'certs' / 'ca.cert.pem'
+        ca_key_path = out_dir / 'private' / 'ca.key.pem'
+        ca_subject = "CN=Root CA"  # Will be read from cert
+        output_path = args.out_file if args.out_file else crl_dir / 'root.crl.pem'
+        passphrase_file = args.passphrase_file if hasattr(args, 'passphrase_file') else None
+    elif args.ca == 'intermediate':
+        ca_cert_path = out_dir / 'certs' / 'intermediate.cert.pem'
+        ca_key_path = out_dir / 'private' / 'intermediate.key.pem'
+        ca_subject = "CN=Intermediate CA"
+        output_path = args.out_file if args.out_file else crl_dir / 'intermediate.crl.pem'
+        passphrase_file = args.passphrase_file if hasattr(args, 'passphrase_file') else None
+    else:
+        raise ValueError(f"Invalid CA type: {args.ca}. Use 'root' or 'intermediate'")
+
+    if not ca_cert_path.exists():
+        raise FileNotFoundError(f"CA certificate not found: {ca_cert_path}")
+    if not ca_key_path.exists():
+        raise FileNotFoundError(f"CA key not found: {ca_key_path}")
+
+    # Get passphrase
+    if passphrase_file:
+        passphrase = crypto_utils.load_passphrase(Path(passphrase_file))
+    else:
+        # Try to find appropriate passphrase file
+        default_pass = out_dir.parent / 'secrets' / f'{args.ca}.pass'
+        if default_pass.exists():
+            passphrase = crypto_utils.load_passphrase(default_pass)
+        else:
+            raise ValueError(f"Passphrase file not provided and default not found: {default_pass}")
+
+    # Generate CRL
+    crl = generate_crl(
+        db_path=db_path,
+        ca_cert_path=ca_cert_path,
+        ca_key_path=ca_key_path,
+        ca_passphrase=passphrase,
+        next_update_days=args.next_update,
+        output_path=output_path,
+        ca_subject=ca_subject
+    )
+
+    logger.info(f"CRL generated successfully: {output_path}")
+
 
 def _get_common_name(name: x509.Name) -> str:
     cn_attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
