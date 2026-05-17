@@ -114,6 +114,40 @@ def main():
     ca_check.add_argument('--db-path', default='./pki/micropki.db')
     ca_check.add_argument('--log-file')
 
+    # Sprint 4: ca validate-chain
+    ca_validate = subparsers.add_parser('validate-chain', help='Validate certificate chain')
+    ca_validate.add_argument('--leaf', required=True, help='Path to leaf certificate')
+    ca_validate.add_argument('--intermediate', action='append', help='Path to intermediate certificate')
+    ca_validate.add_argument('--root', required=True, help='Path to root certificate')
+    ca_validate.add_argument('--log-file')
+
+    # Sprint 5: ca issue-ocsp-cert
+    ca_ocsp_cert = subparsers.add_parser('issue-ocsp-cert', help='Issue OCSP responder certificate')
+    ca_ocsp_cert.add_argument('--ca-cert', required=True)
+    ca_ocsp_cert.add_argument('--ca-key', required=True)
+    ca_ocsp_cert.add_argument('--ca-pass-file', required=True)
+    ca_ocsp_cert.add_argument('--subject', required=True)
+    ca_ocsp_cert.add_argument('--key-type', choices=['rsa', 'ecc'], default='rsa')
+    ca_ocsp_cert.add_argument('--key-size', type=int, default=2048)
+    ca_ocsp_cert.add_argument('--san', action='append')
+    ca_ocsp_cert.add_argument('--out-dir', default='./pki/certs')
+    ca_ocsp_cert.add_argument('--validity-days', type=int, default=365)
+    ca_ocsp_cert.add_argument('--db-path', help='SQLite database path')
+    ca_ocsp_cert.add_argument('--log-file')
+
+    # Sprint 5: ocsp serve
+    ocsp_serve = subparsers.add_parser('ocsp', help='OCSP responder commands')
+    ocsp_sub = ocsp_serve.add_subparsers(dest='ocsp_command', required=True)
+    ocsp_serve_cmd = ocsp_sub.add_parser('serve', help='Start OCSP responder')
+    ocsp_serve_cmd.add_argument('--host', default='127.0.0.1')
+    ocsp_serve_cmd.add_argument('--port', type=int, default=8081)
+    ocsp_serve_cmd.add_argument('--db-path', default='./pki/micropki.db')
+    ocsp_serve_cmd.add_argument('--responder-cert', required=True)
+    ocsp_serve_cmd.add_argument('--responder-key', required=True)
+    ocsp_serve_cmd.add_argument('--ca-cert', required=True)
+    ocsp_serve_cmd.add_argument('--cache-ttl', type=int, default=60)
+    ocsp_serve_cmd.add_argument('--log-file')
+
     args = parser.parse_args()
     log_file = getattr(args, 'log_file', None)
     logger.setup_logger(log_file)
@@ -145,12 +179,28 @@ def main():
             ca.generate_crl_cmd(args)
         elif args.command == 'check-revoked':
             _do_check_revoked(args)
+        elif args.command == 'validate-chain':
+            _do_validate_chain(args)
+        elif args.command == 'issue-ocsp-cert':
+            ca.issue_ocsp_cert(args)
+        elif args.command == 'ocsp' and args.ocsp_command == 'serve':
+            from .ocsp_responder import serve_ocsp
+            serve_ocsp(
+                host=args.host,
+                port=args.port,
+                db_path=Path(args.db_path),
+                responder_cert_path=Path(args.responder_cert),
+                responder_key_path=Path(args.responder_key),
+                ca_cert_path=Path(args.ca_cert),
+                cache_ttl=args.cache_ttl
+            )
         else:
             parser.print_help()
             sys.exit(1)
     except Exception as e:
         log.exception("Command failed")
         sys.exit(1)
+
 
 def _validate_init_args(args):
     if args.key_type == 'rsa' and args.key_size != 4096:
@@ -161,6 +211,7 @@ def _validate_init_args(args):
         raise ValueError(f"Passphrase file not found: {args.passphrase_file}")
     if args.validity_days <= 0:
         raise ValueError("Validity days must be positive")
+
 
 def _validate_intermediate_args(args):
     if args.key_type == 'rsa' and args.key_size != 4096:
@@ -173,12 +224,14 @@ def _validate_intermediate_args(args):
     if args.validity_days <= 0:
         raise ValueError("Validity days must be positive")
 
+
 def _validate_issue_args(args):
     for f in [args.ca_cert, args.ca_key, args.ca_pass_file]:
         if not Path(f).exists():
             raise ValueError(f"File not found: {f}")
     if args.validity_days <= 0:
         raise ValueError("Validity days must be positive")
+
 
 def _do_list_certs(args):
     db_path = Path(args.db_path)
@@ -200,6 +253,7 @@ def _do_list_certs(args):
         writer.writeheader()
         writer.writerows(certs)
 
+
 def _do_show_cert(args):
     db_path = Path(args.db_path)
     if not db_path.exists():
@@ -211,8 +265,9 @@ def _do_show_cert(args):
         sys.exit(1)
     print(cert_data['cert_pem'])
 
+
 def _do_check_revoked(args):
-    from .revocation import validate_reason  # noqa
+    from .revocation import validate_reason
     db_path = Path(args.db_path)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
@@ -225,6 +280,27 @@ def _do_check_revoked(args):
         print(f"REVOKED - Reason: {cert_data['revocation_reason']}, Date: {cert_data['revocation_date']}")
     else:
         print("VALID")
+
+
+def _do_validate_chain(args):
+    from cryptography import x509
+    from . import chain
+
+    leaf = x509.load_pem_x509_certificate(Path(args.leaf).read_bytes())
+    root = x509.load_pem_x509_certificate(Path(args.root).read_bytes())
+    intermediates = []
+    if args.intermediate:
+        for int_path in args.intermediate:
+            cert = x509.load_pem_x509_certificate(Path(int_path).read_bytes())
+            intermediates.append(cert)
+
+    if chain.validate_chain(leaf, intermediates, root):
+        print("Chain validation: SUCCESS")
+        chain.print_chain_info(leaf, intermediates, root)
+    else:
+        print("Chain validation: FAILED")
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()

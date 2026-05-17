@@ -94,8 +94,8 @@ def init_ca(args):
             'serial_hex': serial_hex,
             'subject': subject.rfc4514_string(),
             'issuer': subject.rfc4514_string(),
-            'not_before': cert.not_valid_before_utc.isoformat(),
-            'not_after': cert.not_valid_after_utc.isoformat(),
+            'not_before': cert.not_valid_before.isoformat(),
+            'not_after': cert.not_valid_after.isoformat(),
             'cert_pem': cert_pem.decode('utf-8'),
             'status': 'valid',
             'created_at': now.isoformat()
@@ -115,8 +115,8 @@ def _policy_content(cert, args):
 CA Name (Subject): {cert.subject.rfc4514_string()}
 Certificate Serial Number (hex): {format(cert.serial_number, 'X')}
 Validity Period:
-  Not Before: {cert.not_valid_before_utc.isoformat()}
-  Not After : {cert.not_valid_after_utc.isoformat()}
+  Not Before: {cert.not_valid_before.isoformat()}
+  Not After : {cert.not_valid_after.isoformat()}
 Key Algorithm: {args.key_type.upper()}-{args.key_size}
 Purpose: Root CA for MicroPKI demonstration
 Policy Version: 1.0
@@ -200,8 +200,8 @@ def issue_intermediate(args):
         'serial_hex': serial_hex,
         'subject': subject.rfc4514_string(),
         'issuer': root_cert.subject.rfc4514_string(),
-        'not_before': inter_cert.not_valid_before_utc.isoformat(),
-        'not_after': inter_cert.not_valid_after_utc.isoformat(),
+        'not_before': inter_cert.not_valid_before.isoformat(),
+        'not_after': inter_cert.not_valid_after.isoformat(),
         'cert_pem': inter_cert_pem.decode('utf-8'),
         'status': 'valid',
         'created_at': now.isoformat()
@@ -216,8 +216,8 @@ Intermediate CA Information
 Subject DN: {subject.rfc4514_string()}
 Serial Number (hex): {serial_hex}
 Validity Period:
-  Not Before: {inter_cert.not_valid_before_utc.isoformat()}
-  Not After : {inter_cert.not_valid_after_utc.isoformat()}
+  Not Before: {inter_cert.not_valid_before.isoformat()}
+  Not After : {inter_cert.not_valid_after.isoformat()}
 Key Algorithm: {args.key_type.upper()}-{args.key_size}
 Path Length Constraint: {args.pathlen}
 Issuer (Root CA): {root_cert.subject.rfc4514_string()}
@@ -303,8 +303,8 @@ def issue_certificate(args):
         'serial_hex': serial_hex,
         'subject': subject.rfc4514_string(),
         'issuer': ca_cert.subject.rfc4514_string(),
-        'not_before': ee_cert.not_valid_before_utc.isoformat(),
-        'not_after': ee_cert.not_valid_after_utc.isoformat(),
+        'not_before': ee_cert.not_valid_before.isoformat(),
+        'not_after': ee_cert.not_valid_after.isoformat(),
         'cert_pem': cert_pem.decode('utf-8'),
         'status': 'valid',
         'created_at': now.isoformat()
@@ -383,8 +383,129 @@ def generate_crl_cmd(args):
     )
 
     logger.info(f"CRL generated successfully: {output_path}")
+def issue_ocsp_cert(args):
+    """Issue an OCSP signing certificate."""
+    from .crypto_utils import generate_rsa_key, generate_ecc_key, save_pem, load_passphrase, load_encrypted_private_key
+    from .certificates import parse_dn
+    from .csr import parse_san_string
+    from .database import insert_certificate
+    from .serial import generate_serial, serial_to_hex
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+    from datetime import datetime, timedelta, timezone
+    import logging
+    from pathlib import Path
 
+    logger = logging.getLogger(__name__)
 
+    # Load CA
+    ca_cert = x509.load_pem_x509_certificate(Path(args.ca_cert).read_bytes())
+    ca_pass = load_passphrase(Path(args.ca_pass_file))
+    ca_key = load_encrypted_private_key(Path(args.ca_key), ca_pass)
+
+    # Generate key pair
+    if args.key_type == 'rsa':
+        key = generate_rsa_key(args.key_size)
+    else:
+        key = generate_ecc_key()
+
+    # Save unencrypted private key (warning)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    key_path = out_dir / 'ocsp.key.pem'
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    save_pem(key_pem, key_path, mode=0o600)
+    logger.warning(f"OCSP responder private key saved UNENCRYPTED to {key_path}")
+
+    # Parse subject and SANs
+    subject = parse_dn(args.subject)
+    san_entries = []
+    if args.san:
+        for san in args.san:
+            san_entries.append(parse_san_string(san))
+
+    # Database
+    db_path = Path(args.db_path) if args.db_path else out_dir.parent / 'micropki.db'
+    if not db_path.exists():
+        raise RuntimeError(f"Database {db_path} does not exist. Run 'micropki db init' first.")
+
+    serial_int = generate_serial(db_path)
+    serial_hex = serial_to_hex(serial_int)
+    now = datetime.now(timezone.utc)
+
+    # Build certificate
+    builder = x509.CertificateBuilder()
+    builder = builder.subject_name(subject)
+    builder = builder.issuer_name(ca_cert.subject)
+    builder = builder.public_key(key.public_key())
+    builder = builder.serial_number(serial_int)
+    builder = builder.not_valid_before(now)
+    builder = builder.not_valid_after(now + timedelta(days=args.validity_days))
+
+    # Basic Constraints: CA=FALSE (critical)
+    builder = builder.add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+
+    # Key Usage: digitalSignature (critical)
+    builder = builder.add_extension(
+        x509.KeyUsage(
+            digital_signature=True,
+            content_commitment=False,
+            key_encipherment=False,
+            data_encipherment=False,
+            key_agreement=False,
+            key_cert_sign=False,
+            crl_sign=False,
+            encipher_only=False,
+            decipher_only=False
+        ),
+        critical=True
+    )
+
+    # Extended Key Usage: OCSPSigning
+    builder = builder.add_extension(
+        x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]),
+        critical=False
+    )
+
+    # Subject Alternative Name
+    if san_entries:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+
+    # SKI/AKI
+    ski = x509.SubjectKeyIdentifier.from_public_key(key.public_key())
+    builder = builder.add_extension(ski, critical=False)
+    aki = x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key())
+    builder = builder.add_extension(aki, critical=False)
+
+    # Sign
+    hash_algo = hashes.SHA256() if args.key_type == 'rsa' else hashes.SHA384()
+    cert = builder.sign(private_key=ca_key, algorithm=hash_algo)
+
+    # Save certificate
+    cert_path = out_dir / 'ocsp.cert.pem'
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    cert_path.write_bytes(cert_pem)
+    logger.info(f"OCSP responder certificate saved to {cert_path}")
+
+    # Insert into database
+    cert_data = {
+        'serial_hex': serial_hex,
+        'subject': subject.rfc4514_string(),
+        'issuer': ca_cert.subject.rfc4514_string(),
+        'not_before': cert.not_valid_before.isoformat(),
+        'not_after': cert.not_valid_after.isoformat(),
+        'cert_pem': cert_pem.decode('utf-8'),
+        'status': 'valid',
+        'created_at': now.isoformat()
+    }
+    insert_certificate(db_path, cert_data)
+
+    logger.info(f"Issued OCSP responder certificate with serial {serial_hex}")
 def _get_common_name(name: x509.Name) -> str:
     cn_attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
     return cn_attrs[0].value if cn_attrs else None
