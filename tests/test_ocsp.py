@@ -106,8 +106,8 @@ def test_env():
             'serial_hex': format(ee_cert.serial_number, 'X'),
             'subject': ee_subj.rfc4514_string(),
             'issuer': ca_subj.rfc4514_string(),
-            'not_before': ee_cert.not_valid_before.isoformat(),
-            'not_after': ee_cert.not_valid_after.isoformat(),
+            'not_before': ee_cert.not_valid_before_utc.isoformat(),
+            'not_after': ee_cert.not_valid_after_utc.isoformat(),
             'cert_pem': 'DUMMY',
             'status': 'valid',
             'created_at': datetime.now(timezone.utc).isoformat()

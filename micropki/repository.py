@@ -139,3 +139,71 @@ def serve_repository(host, port, db_path, cert_dir, crl_dir):
     except KeyboardInterrupt:
         logger.info("Server stopped by user")
         server.shutdown()
+
+def do_POST(self):
+    parsed = urlparse(self.path)
+    if parsed.path == '/request-cert':
+        self._handle_request_cert(parsed.query)
+    else:
+        self.send_error(404, "Not Found")
+
+def _handle_request_cert(self, query_string):
+    from urllib.parse import parse_qs
+    from argparse import Namespace
+    import tempfile
+    from . import ca
+
+    params = parse_qs(query_string)
+    template = params.get('template', [''])[0]
+    if not template or template not in ['server', 'client', 'code_signing']:
+        self.send_error(400, "Missing or invalid template parameter")
+        return
+
+    content_length = int(self.headers.get('Content-Length', 0))
+    if content_length == 0:
+        self.send_error(400, "Empty request body")
+        return
+    csr_data = self.rfile.read(content_length)
+
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.csr', delete=False) as tmp:
+        tmp.write(csr_data)
+        csr_path = tmp.name
+
+    out_dir = Path(self.cert_dir).parent / 'certs'
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pass_file = Path(self.cert_dir).parent.parent / 'secrets' / 'intermediate.pass'
+    if not pass_file.exists():
+        self.send_error(500, "CA passphrase file not found")
+        return
+
+    args = Namespace(
+        csr=csr_path,
+        ca_cert=str(self.cert_dir / 'intermediate.cert.pem'),
+        ca_key=str(self.cert_dir.parent / 'private' / 'intermediate.key.pem'),
+        ca_pass_file=str(pass_file),
+        template=template,
+        subject='',
+        san=None,
+        out_dir=str(out_dir),
+        validity_days=365,
+        db_path=str(self.db_path),
+        key_type='rsa',
+        key_size=2048
+    )
+
+    try:
+        ca.issue_certificate(args)
+        cert_files = sorted(out_dir.glob('*.cert.pem'), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not cert_files:
+            raise Exception("No certificate generated")
+        cert_pem = cert_files[0].read_bytes()
+        self.send_response(201)
+        self.send_header('Content-Type', 'application/x-pem-file')
+        self.end_headers()
+        self.wfile.write(cert_pem)
+    except Exception as e:
+        logger.error(f"CSR issuance failed: {e}")
+        self.send_error(500, f"Internal error: {e}")
+    finally:
+        Path(csr_path).unlink(missing_ok=True)

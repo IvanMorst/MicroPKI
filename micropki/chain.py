@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 from cryptography import x509
 from cryptography.x509.oid import ExtensionOID
 from cryptography.exceptions import InvalidSignature
@@ -20,55 +20,53 @@ def verify_signature(cert: x509.Certificate, issuer_cert: x509.Certificate) -> b
         signature = cert.signature
         tbs_data = cert.tbs_certificate_bytes
 
-        # Определяем тип ключа и алгоритм подписи
         sig_alg_oid = cert.signature_algorithm_oid
+        alg_name = sig_alg_oid._name.lower() if hasattr(sig_alg_oid, '_name') else str(sig_alg_oid)
 
-        # Для RSA
-        if 'RSA' in str(sig_alg_oid) or 'rsa' in sig_alg_oid._name:
-            # Определяем хеш-алгоритм
-            if 'sha256' in sig_alg_oid._name:
+        if 'rsa' in alg_name:
+            if 'sha256' in alg_name:
                 hash_algo = hashes.SHA256()
-                pad = padding.PKCS1v15()
-            elif 'sha384' in sig_alg_oid._name:
+            elif 'sha384' in alg_name:
                 hash_algo = hashes.SHA384()
-                pad = padding.PKCS1v15()
-            elif 'sha512' in sig_alg_oid._name:
-                hash_algo = hashes.SHA512()
-                pad = padding.PKCS1v15()
-            else:
-                hash_algo = hashes.SHA256()
-                pad = padding.PKCS1v15()
-
-            public_key.verify(signature, tbs_data, pad, hash_algo)
-
-        # Для ECDSA
-        elif 'ecdsa' in sig_alg_oid._name:
-            if 'sha256' in sig_alg_oid._name:
-                hash_algo = hashes.SHA256()
-            elif 'sha384' in sig_alg_oid._name:
-                hash_algo = hashes.SHA384()
-            elif 'sha512' in sig_alg_oid._name:
+            elif 'sha512' in alg_name:
                 hash_algo = hashes.SHA512()
             else:
                 hash_algo = hashes.SHA256()
-
+            public_key.verify(signature, tbs_data, padding.PKCS1v15(), hash_algo)
+        elif 'ecdsa' in alg_name:
+            if 'sha256' in alg_name:
+                hash_algo = hashes.SHA256()
+            elif 'sha384' in alg_name:
+                hash_algo = hashes.SHA384()
+            elif 'sha512' in alg_name:
+                hash_algo = hashes.SHA512()
+            else:
+                hash_algo = hashes.SHA256()
             public_key.verify(signature, tbs_data, hash_algo)
         else:
-            # Попробуем стандартный способ
-            from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
-            public_key.verify(
-                signature,
-                tbs_data,
-                rsa_padding.PKCS1v15(),
-                cert.signature_hash_algorithm
-            )
+            public_key.verify(signature, tbs_data, padding.PKCS1v15(), hashes.SHA256())
 
         return True
-
     except InvalidSignature:
         return False
     except Exception as e:
         logger.error(f"Signature verification error: {e}")
+        return False
+
+
+def verify_crl_signature(crl: x509.CertificateRevocationList, issuer_cert: x509.Certificate) -> bool:
+    """Verify CRL signature using issuer's public key."""
+    try:
+        issuer_cert.public_key().verify(
+            crl.signature,
+            crl.tbs_certlist_bytes,
+            crl.signature_algorithm_parameters
+        )
+        return True
+    except InvalidSignature:
+        return False
+    except Exception as e:
+        logger.error(f"CRL signature verification error: {e}")
         return False
 
 
@@ -84,36 +82,29 @@ def validate_chain(
     """
     logger_local = logging.getLogger(__name__)
 
-    # Проверяем корневой сертификат (самоподписанный)
     if not verify_signature(root_cert, root_cert):
         logger_local.error("Root certificate self-signature verification failed")
         return False
 
-    # Проверяем подписи в цепочке (leaf -> intermediates -> root)
-    # Сначала проверяем leaf подписан intermediate или root
-    if intermediates:
-        # Leaf подписан первым intermediate
-        if not verify_signature(leaf_cert, intermediates[0]):
-            logger_local.error("Leaf certificate not signed by first intermediate")
+    all_certs = [leaf_cert] + intermediates
+
+    for i in range(len(all_certs) - 1):
+        current_cert = all_certs[i]
+        issuer_cert = all_certs[i + 1]
+
+        if not verify_signature(current_cert, issuer_cert):
+            logger_local.error(f"Certificate at level {i} not properly signed")
             return False
 
-        # Проверяем цепочку intermediate
-        for i in range(len(intermediates) - 1):
-            if not verify_signature(intermediates[i], intermediates[i + 1]):
-                logger_local.error(f"Intermediate {i} not signed by intermediate {i + 1}")
-                return False
-
-        # Последний intermediate подписан root
+    if intermediates:
         if not verify_signature(intermediates[-1], root_cert):
             logger_local.error("Last intermediate not signed by root")
             return False
     else:
-        # Нет intermediate - leaf должен быть подписан root
         if not verify_signature(leaf_cert, root_cert):
             logger_local.error("Leaf certificate not signed by root")
             return False
 
-    # Проверяем срок действия всех сертификатов
     now = datetime.now(timezone.utc)
 
     def normalize_datetime(dt):
@@ -121,47 +112,22 @@ def validate_chain(
             return dt.replace(tzinfo=timezone.utc)
         return dt
 
-    # Проверяем leaf сертификат
-    leaf_not_before = normalize_datetime(leaf_cert.not_valid_before)
-    leaf_not_after = normalize_datetime(leaf_cert.not_valid_after)
-    if now < leaf_not_before or now > leaf_not_after:
-        logger_local.error(f"Leaf certificate {leaf_cert.subject.rfc4514_string()} is not valid")
-        return False
-
-    # Проверяем intermediate сертификаты
-    for cert in intermediates:
+    for cert in all_certs + [root_cert]:
         not_before = normalize_datetime(cert.not_valid_before)
         not_after = normalize_datetime(cert.not_valid_after)
         if now < not_before or now > not_after:
-            logger_local.error(f"Intermediate certificate {cert.subject.rfc4514_string()} is not valid")
+            logger_local.error(f"Certificate is not valid")
             return False
 
-        # Проверяем BasicConstraints: должен быть CA
-        try:
-            bc = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS)
-            if not bc.value.ca:
-                logger_local.error(f"Intermediate certificate {cert.subject.rfc4514_string()} is not a CA certificate")
+        if cert != leaf_cert:
+            try:
+                bc = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS)
+                if not bc.value.ca:
+                    logger_local.error(f"Certificate is not a CA certificate")
+                    return False
+            except x509.ExtensionNotFound:
+                logger_local.error(f"Certificate missing BasicConstraints")
                 return False
-        except x509.ExtensionNotFound:
-            logger_local.error(f"Intermediate certificate {cert.subject.rfc4514_string()} missing BasicConstraints")
-            return False
-
-    # Проверяем корневой сертификат
-    root_not_before = normalize_datetime(root_cert.not_valid_before)
-    root_not_after = normalize_datetime(root_cert.not_valid_after)
-    if now < root_not_before or now > root_not_after:
-        logger_local.error(f"Root certificate {root_cert.subject.rfc4514_string()} is not valid")
-        return False
-
-    # Проверяем BasicConstraints для root
-    try:
-        bc = root_cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS)
-        if not bc.value.ca:
-            logger_local.error(f"Root certificate {root_cert.subject.rfc4514_string()} is not a CA certificate")
-            return False
-    except x509.ExtensionNotFound:
-        logger_local.error(f"Root certificate {root_cert.subject.rfc4514_string()} missing BasicConstraints")
-        return False
 
     return True
 

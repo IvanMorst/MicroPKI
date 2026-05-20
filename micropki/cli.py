@@ -148,6 +148,46 @@ def main():
     ocsp_serve_cmd.add_argument('--cache-ttl', type=int, default=60)
     ocsp_serve_cmd.add_argument('--log-file')
 
+    # Sprint 6: client subcommands
+    client_parser = subparsers.add_parser('client', help='Client tools')
+    client_sub = client_parser.add_subparsers(dest='client_command', required=True)
+
+    gen_csr = client_sub.add_parser('gen-csr', help='Generate private key and CSR')
+    gen_csr.add_argument('--subject', required=True)
+    gen_csr.add_argument('--key-type', choices=['rsa', 'ecc'], default='rsa')
+    gen_csr.add_argument('--key-size', type=int, default=2048)
+    gen_csr.add_argument('--san', action='append')
+    gen_csr.add_argument('--out-key', default='./key.pem')
+    gen_csr.add_argument('--out-csr', default='./request.csr.pem')
+    gen_csr.add_argument('--log-file')
+
+    req_cert = client_sub.add_parser('request-cert', help='Submit CSR to CA')
+    req_cert.add_argument('--csr', required=True)
+    req_cert.add_argument('--template', required=True, choices=['server', 'client', 'code_signing'])
+    req_cert.add_argument('--ca-url', required=True)
+    req_cert.add_argument('--api-key', help='API key for authentication')
+    req_cert.add_argument('--out-cert', default='./cert.pem')
+    req_cert.add_argument('--log-file')
+
+    validate = client_sub.add_parser('validate', help='Validate certificate chain')
+    validate.add_argument('--cert', required=True)
+    validate.add_argument('--untrusted', action='append')
+    validate.add_argument('--trusted', default='./pki/certs/ca.cert.pem')
+    validate.add_argument('--crl-url', help='CRL URL')
+    validate.add_argument('--ocsp-url', help='OCSP URL')
+    validate.add_argument('--mode', choices=['chain', 'full'], default='full')
+    validate.add_argument('--validation-time', help='ISO timestamp for validation (testing)')
+    validate.add_argument('--log-file')
+
+    check_status = client_sub.add_parser('check-status', help='Check revocation status')
+    check_status.add_argument('--cert', required=True)
+    check_status.add_argument('--ca-cert', required=True)
+    check_status.add_argument('--crl-url')
+    check_status.add_argument('--ocsp-url')
+    check_status.add_argument('--log-file')
+
+    # Добавить --csr флаг к существующему issue-cert
+    ca_issue.add_argument('--csr', help='Sign an external CSR instead of generating new key')
     args = parser.parse_args()
     log_file = getattr(args, 'log_file', None)
     logger.setup_logger(log_file)
@@ -183,6 +223,19 @@ def main():
             _do_validate_chain(args)
         elif args.command == 'issue-ocsp-cert':
             ca.issue_ocsp_cert(args)
+        elif args.command == 'client':
+            if args.client_command == 'gen-csr':
+                from .client import client_gen_csr
+                client_gen_csr(args)
+            elif args.client_command == 'request-cert':
+                from .client import client_request_cert
+                client_request_cert(args)
+            elif args.client_command == 'validate':
+                from .client import client_validate
+                client_validate(args)
+            elif args.client_command == 'check-status':
+                from .client import client_check_status
+                client_check_status(args)
         elif args.command == 'ocsp' and args.ocsp_command == 'serve':
             from .ocsp_responder import serve_ocsp
             serve_ocsp(
