@@ -7,13 +7,23 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID, ExtensionOID
 
+from .audit import init_audit_log, log_audit
+from .transparency import init_ct_log, log_certificate_to_ct
+from .policy import validate_key_size, validate_validity_days, validate_san_types
+from .compromise import is_key_compromised, mark_key_compromised, init_compromised_table
+
 from . import crypto_utils
 from . import certificates
 from . import csr as csr_module
 from . import templates
-from .database import insert_certificate
+from .database import insert_certificate, update_certificate_status, get_certificate_by_serial
+from .revocation import validate_reason
 from .serial import generate_serial, serial_to_hex
 
+from .policy import validate_key_size, validate_validity_days, validate_san_types
+from .audit import init_audit_log, log_audit
+from .transparency import init_ct_log, log_certificate_to_ct
+from .compromise import is_key_compromised
 logger = logging.getLogger(__name__)
 
 
@@ -39,8 +49,32 @@ Creation Date: {datetime.now(timezone.utc).isoformat()}
 
 
 def init_ca(args):
-    """Initialize self-signed Root CA (Sprint 1) with optional DB insertion."""
+    """Initialize self-signed Root CA with audit and policy."""
+    from .audit import init_audit_log, log_audit
+    from .transparency import init_ct_log, log_certificate_to_ct
+    from .policy import validate_key_size, validate_validity_days
+
     out_dir = Path(args.out_dir).resolve()
+
+    # Initialise audit and CT logs
+    init_audit_log(out_dir)
+    ct_path = init_ct_log(out_dir)
+
+    # Validate policy
+    cert_type = 'root'
+    key_type = args.key_type
+    key_size = args.key_size
+
+    valid, msg = validate_key_size(key_size, cert_type, key_type)
+    if not valid:
+        log_audit("AUDIT", "ca_init", "failure", msg, {"subject": args.subject})
+        raise ValueError(msg)
+
+    valid, msg = validate_validity_days(args.validity_days, cert_type)
+    if not valid:
+        log_audit("AUDIT", "ca_init", "failure", msg, {"subject": args.subject})
+        raise ValueError(msg)
+
     private_dir = out_dir / 'private'
     certs_dir = out_dir / 'certs'
     private_dir.mkdir(parents=True, exist_ok=True)
@@ -113,8 +147,8 @@ def init_ca(args):
             'serial_hex': serial_hex,
             'subject': subject.rfc4514_string(),
             'issuer': subject.rfc4514_string(),
-            'not_before': cert.not_valid_before.isoformat(),
-            'not_after': cert.not_valid_after.isoformat(),
+            'not_before': cert.not_valid_before_utc.isoformat(),
+            'not_after': cert.not_valid_after_utc.isoformat(),
             'cert_pem': cert_pem.decode('utf-8'),
             'status': 'valid',
             'created_at': now.isoformat()
@@ -124,6 +158,14 @@ def init_ca(args):
     policy_path = out_dir / 'policy.txt'
     policy_path.write_text(_policy_content(cert, args))
     logger.info(f"Policy document saved to {policy_path}")
+
+    # Audit log
+    log_audit("AUDIT", "ca_init", "success",
+              f"Root CA initialised for {args.subject}",
+              {"subject": args.subject, "serial": serial_hex, "key_type": key_type, "key_size": key_size})
+
+    # CT log
+    log_certificate_to_ct(ct_path, cert, subject.rfc4514_string())
 
     logger.info("Root CA initialisation successful")
 
@@ -234,17 +276,25 @@ Creation Date: {now.isoformat()}
 
 
 def issue_certificate(args):
-    """Issue an end-entity certificate, optionally from a CSR."""
-    from .crypto_utils import generate_rsa_key, generate_ecc_key, save_pem, load_passphrase, load_encrypted_private_key
-    from .certificates import parse_dn
-    from .csr import parse_san_string
-    from .database import insert_certificate
-    from .serial import generate_serial, serial_to_hex
+    """Issue an end-entity certificate with policy enforcement."""
+    from .audit import init_audit_log, log_audit
+    from .transparency import init_ct_log, log_certificate_to_ct
+    from .policy import validate_key_size, validate_validity_days, validate_san_types
+    from .compromise import is_key_compromised
+
+    out_dir = Path(args.out_dir)
+
+    # Initialise audit and CT logs
+    init_audit_log(out_dir.parent)
+    ct_path = init_ct_log(out_dir.parent)
 
     # Load CA
     ca_cert = x509.load_pem_x509_certificate(Path(args.ca_cert).read_bytes())
-    ca_pass = load_passphrase(Path(args.ca_pass_file))
-    ca_key = load_encrypted_private_key(Path(args.ca_key), ca_pass)
+    ca_pass = crypto_utils.load_passphrase(Path(args.ca_pass_file))
+    ca_key = crypto_utils.load_encrypted_private_key(Path(args.ca_key), ca_pass)
+
+    cert_type = 'end_entity'
+    template_name = args.template
 
     # Determine subject, san, and public key from either CSR or arguments
     if hasattr(args, 'csr') and args.csr:
@@ -252,6 +302,24 @@ def issue_certificate(args):
         if not csr_path.exists():
             raise FileNotFoundError(f"CSR not found: {csr_path}")
         csr = x509.load_pem_x509_csr(csr_path.read_bytes())
+
+        # Check if public key is compromised
+        if is_key_compromised(db_path, csr):
+            log_audit("AUDIT", "issue_certificate", "failure",
+                      "Certificate request rejected - compromised key",
+                      {"subject": str(csr.subject)})
+            raise ValueError("This key has been compromised and cannot be used for new certificates")
+
+        # Validate key size from CSR
+        public_key = csr.public_key()
+        if hasattr(public_key, 'key_size'):
+            key_size = public_key.key_size
+            key_type = 'rsa' if key_size else 'ecc'
+            valid, msg = validate_key_size(key_size, cert_type, key_type)
+            if not valid:
+                log_audit("AUDIT", "issue_certificate", "failure", msg, {"subject": str(csr.subject)})
+                raise ValueError(msg)
+
         subject = csr.subject
         san_entries = []
         try:
@@ -259,26 +327,26 @@ def issue_certificate(args):
             san_entries = list(san_ext.value)
         except x509.ExtensionNotFound:
             pass
-        public_key = csr.public_key()
         key_path = None
-        out_dir = Path(args.out_dir)
     else:
+        # Validate key size for internal generation
+        key_type = 'rsa'  # could be from args
+        key_size = 2048
+        valid, msg = validate_key_size(key_size, cert_type, key_type)
+        if not valid:
+            log_audit("AUDIT", "issue_certificate", "failure", msg, {"subject": args.subject})
+            raise ValueError(msg)
+
         # Generate new key pair
-        key_type = 'rsa'  # could be made configurable
-        if key_type == 'rsa':
-            ee_key = generate_rsa_key(2048)
-        else:
-            ee_key = generate_ecc_key()
+        ee_key = crypto_utils.generate_rsa_key(2048)
         public_key = ee_key.public_key()
-        subject = parse_dn(args.subject)
+        subject = certificates.parse_dn(args.subject)
         san_entries = []
         if args.san:
             for san_string in args.san:
-                san_entries.append(parse_san_string(san_string))
-        out_dir = Path(args.out_dir)
+                san_entries.append(csr_module.parse_san_string(san_string))
+
         out_dir.mkdir(parents=True, exist_ok=True)
-        serial_int = generate_serial(
-            Path(args.db_path) if hasattr(args, 'db_path') and args.db_path else out_dir.parent / 'micropki.db')
         cn = _get_common_name(subject)
         if not cn:
             cn = f"cert-{serial_int}"
@@ -288,17 +356,27 @@ def issue_certificate(args):
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption()
         )
-        save_pem(key_pem, key_path, mode=0o600)
+        crypto_utils.save_pem(key_pem, key_path, mode=0o600)
         logger.warning(f"Private key saved UNENCRYPTED to {key_path}")
 
-    # Validate template and SANs
-    template = templates.get_template(args.template)
-    if not template.validate_san_types(san_entries):
-        allowed = ', '.join(template.get_allowed_san_types())
-        raise ValueError(f"Invalid SAN types for {args.template} template. Allowed: {allowed}")
+    # Validate SAN types against template
+    valid, msg = validate_san_types(san_entries, template_name)
+    if not valid:
+        log_audit("AUDIT", "issue_certificate", "failure", msg, {"subject": str(subject)})
+        raise ValueError(msg)
 
-    if args.template == 'server' and not san_entries:
+    # Validate server certificate requires SAN
+    if template_name == 'server' and not san_entries:
+        log_audit("AUDIT", "issue_certificate", "failure",
+                  "Server certificate requires at least one SAN",
+                  {"subject": str(subject)})
         raise ValueError("Server certificate requires at least one SAN (DNS or IP)")
+
+    # Validate validity period
+    valid, msg = validate_validity_days(args.validity_days, cert_type)
+    if not valid:
+        log_audit("AUDIT", "issue_certificate", "failure", msg, {"subject": str(subject)})
+        raise ValueError(msg)
 
     # Database
     db_path = Path(args.db_path) if hasattr(args, 'db_path') and args.db_path else out_dir.parent / 'micropki.db'
@@ -310,6 +388,7 @@ def issue_certificate(args):
     now = datetime.now(timezone.utc)
 
     # Build certificate
+    template = templates.get_template(template_name)
     builder = x509.CertificateBuilder()
     builder = builder.subject_name(subject)
     builder = builder.issuer_name(ca_cert.subject)
@@ -348,33 +427,130 @@ def issue_certificate(args):
         'serial_hex': serial_hex,
         'subject': subject.rfc4514_string(),
         'issuer': ca_cert.subject.rfc4514_string(),
-        'not_before': ee_cert.not_valid_before.isoformat(),
-        'not_after': ee_cert.not_valid_after.isoformat(),
+        'not_before': ee_cert.not_valid_before_utc.isoformat(),
+        'not_after': ee_cert.not_valid_after_utc.isoformat(),
         'cert_pem': cert_pem.decode('utf-8'),
         'status': 'valid',
         'created_at': now.isoformat()
     }
     insert_certificate(db_path, cert_data)
 
-    logger.info(f"Issued {args.template} certificate:")
+    # Audit log
+    log_audit("AUDIT", "issue_certificate", "success",
+              f"Issued {template_name} certificate for {subject.rfc4514_string()}",
+              {"serial": serial_hex, "subject": subject.rfc4514_string(),
+               "template": template_name, "sans": [str(s) for s in san_entries]})
+
+    # CT log
+    log_certificate_to_ct(ct_path, ee_cert, ca_cert.subject.rfc4514_string())
+
+    logger.info(f"Issued {template_name} certificate:")
     logger.info(f"  Subject: {subject.rfc4514_string()}")
     logger.info(f"  Serial: {serial_hex}")
     if san_entries:
         logger.info(f"  SANs: {san_entries}")
 
+    return ee_cert, None if (hasattr(args, 'csr') and args.csr) else ee_key
+
 
 def revoke_certificate_cmd(args):
-    """Execute certificate revocation command."""
-    from .revocation import revoke_certificate
+    """Execute certificate revocation command with audit."""
+    from .audit import init_audit_log, log_audit
+
     db_path = Path(args.db_path) if args.db_path else Path('./pki/micropki.db')
+    out_dir = db_path.parent
+
+    init_audit_log(out_dir)
+
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
-    success = revoke_certificate(db_path, args.serial, args.reason, args.force)
-    if success:
-        logger.info(f"Certificate {args.serial} revoked successfully")
+    cert_data = get_certificate_by_serial(db_path, args.serial)
+    if not cert_data:
+        log_audit("AUDIT", "revoke_certificate", "failure",
+                  f"Certificate {args.serial} not found",
+                  {"serial": args.serial})
+        raise ValueError(f"Certificate with serial {args.serial} not found")
+
+    if cert_data['status'] == 'revoked':
+        logger.warning(f"Certificate {args.serial} is already revoked")
+        log_audit("AUDIT", "revoke_certificate", "warning",
+                  f"Attempted to revoke already revoked certificate {args.serial}",
+                  {"serial": args.serial})
+        return False
+
+    reason_enum = validate_reason(args.reason)
+    update_certificate_status(db_path, args.serial, 'revoked', args.reason)
+    logger.info(f"Revoked certificate {args.serial} with reason: {args.reason}")
+
+    log_audit("AUDIT", "revoke_certificate", "success",
+              f"Revoked certificate {args.serial} with reason {args.reason}",
+              {"serial": args.serial, "reason": args.reason, "subject": cert_data['subject']})
+
+    return True
 
 
+def compromise_certificate_cmd(args):
+    """Execute certificate compromise command."""
+    from .audit import init_audit_log, log_audit
+    from .compromise import mark_key_compromised
+
+    cert_path = Path(args.cert)
+    if not cert_path.exists():
+        raise FileNotFoundError(f"Certificate not found: {cert_path}")
+
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    serial_hex = format(cert.serial_number, 'X')
+
+    out_dir = cert_path.parent.parent
+    db_path = out_dir / 'micropki.db'
+
+    init_audit_log(out_dir)
+
+    # Revoke the certificate
+    revoke_certificate(db_path, serial_hex, args.reason, args.force)
+
+    # Mark key as compromised
+    mark_key_compromised(db_path, serial_hex, args.reason)
+
+    log_audit("AUDIT", "ca_compromise", "success",
+              f"Certificate {serial_hex} marked as compromised and revoked",
+              {"serial": serial_hex, "cert_path": str(cert_path), "reason": args.reason})
+
+    # Trigger emergency CRL update
+    from .crl import generate_crl
+    crl_dir = out_dir / 'crl'
+    crl_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find CA that issued this certificate
+    issuer_dn = cert.issuer.rfc4514_string()
+    if "Root" in issuer_dn:
+        ca_type = 'root'
+        ca_cert_path = out_dir / 'certs' / 'ca.cert.pem'
+        ca_key_path = out_dir / 'private' / 'ca.key.pem'
+        passphrase_file = out_dir.parent / 'secrets' / 'root.pass'
+        output_path = crl_dir / 'root.crl.pem'
+    else:
+        ca_type = 'intermediate'
+        ca_cert_path = out_dir / 'certs' / 'intermediate.cert.pem'
+        ca_key_path = out_dir / 'private' / 'intermediate.key.pem'
+        passphrase_file = out_dir.parent / 'secrets' / 'intermediate.pass'
+        output_path = crl_dir / 'intermediate.crl.pem'
+
+    if ca_cert_path.exists() and ca_key_path.exists() and passphrase_file.exists():
+        passphrase = crypto_utils.load_passphrase(passphrase_file)
+        generate_crl(
+            db_path=db_path,
+            ca_cert_path=ca_cert_path,
+            ca_key_path=ca_key_path,
+            ca_passphrase=passphrase,
+            next_update_days=7,
+            output_path=output_path,
+            ca_subject=issuer_dn
+        )
+        logger.info(f"Emergency CRL generated at {output_path}")
+
+    print(f"Certificate {serial_hex} has been compromised, revoked, and added to blocklist")
 def generate_crl_cmd(args):
     """Execute CRL generation command."""
     from .crl import generate_crl

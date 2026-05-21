@@ -9,6 +9,9 @@ from . import ca
 from .database import init_db, list_certificates, get_certificate_by_serial
 from .repository import serve_repository
 
+from .audit import query_audit_log, verify_audit_log
+from .compromise import init_compromised_table
+
 def main():
     parser = argparse.ArgumentParser(description="MicroPKI - Minimal PKI", prog="micropki")
     subparsers = parser.add_subparsers(dest='command', required=True)
@@ -83,6 +86,9 @@ def main():
     repo_serve_cmd.add_argument('--cert-dir', default='./pki/certs')
     repo_serve_cmd.add_argument('--crl-dir', default='./pki/crl')
     repo_serve_cmd.add_argument('--log-file')
+
+    repo_serve_cmd.add_argument('--rate-limit', type=float, default=0, help='Requests per second per IP')
+    repo_serve_cmd.add_argument('--rate-burst', type=int, default=10, help='Burst allowance')
 
     # Sprint 4: ca revoke
     ca_revoke = subparsers.add_parser('revoke', help='Revoke a certificate')
@@ -186,6 +192,34 @@ def main():
     check_status.add_argument('--ocsp-url')
     check_status.add_argument('--log-file')
 
+    # Sprint 7: audit query
+    audit_query = subparsers.add_parser('audit', help='Audit log commands')
+    audit_sub = audit_query.add_subparsers(dest='audit_command', required=True)
+
+    audit_query_cmd = audit_sub.add_parser('query', help='Query audit log')
+    audit_query_cmd.add_argument('--from', dest='from_time', help='Start timestamp (ISO 8601)')
+    audit_query_cmd.add_argument('--to', dest='to_time', help='End timestamp (ISO 8601)')
+    audit_query_cmd.add_argument('--level', choices=['INFO', 'WARNING', 'ERROR', 'AUDIT'])
+    audit_query_cmd.add_argument('--operation', help='Filter by operation')
+    audit_query_cmd.add_argument('--serial', help='Filter by certificate serial')
+    audit_query_cmd.add_argument('--format', choices=['table', 'json', 'csv'], default='table')
+    audit_query_cmd.add_argument('--log-file', help='Audit log path', default='./pki/audit/audit.log')
+    audit_query_cmd.add_argument('--verify', action='store_true', help='Verify integrity')
+
+    audit_verify_cmd = audit_sub.add_parser('verify', help='Verify audit log integrity')
+    audit_verify_cmd.add_argument('--log-file', default='./pki/audit/audit.log')
+    audit_verify_cmd.add_argument('--chain-file', default='./pki/audit/chain.dat')
+
+    # Sprint 7: ca compromise
+    ca_compromise = subparsers.add_parser('compromise', help='Simulate key compromise')
+    ca_compromise.add_argument('--cert', required=True, help='Path to certificate')
+    ca_compromise.add_argument('--reason', default='keyCompromise',
+                               choices=['keyCompromise', 'cACompromise', 'affiliationChanged',
+                                        'superseded', 'cessationOfOperation', 'certificateHold',
+                                        'privilegeWithdrawn', 'aACompromise'])
+    ca_compromise.add_argument('--force', action='store_true', help='Skip confirmation')
+    ca_compromise.add_argument('--log-file')
+
     # Добавить --csr флаг к существующему issue-cert
     ca_issue.add_argument('--csr', help='Sign an external CSR instead of generating new key')
     args = parser.parse_args()
@@ -212,7 +246,8 @@ def main():
         elif args.command == 'show-cert':
             _do_show_cert(args)
         elif args.command == 'repo' and args.repo_command == 'serve':
-            serve_repository(args.host, args.port, args.db_path, args.cert_dir, args.crl_dir)
+            serve_repository(args.host, args.port, args.db_path, args.cert_dir, args.crl_dir,
+                             rate_limit=args.rate_limit, rate_burst=args.rate_burst)
         elif args.command == 'revoke':
             ca.revoke_certificate_cmd(args)
         elif args.command == 'gen-crl':
@@ -247,6 +282,65 @@ def main():
                 ca_cert_path=Path(args.ca_cert),
                 cache_ttl=args.cache_ttl
             )
+
+        elif args.command == 'audit' and args.audit_command == 'query':
+            from .audit import query_audit_log, verify_audit_log
+            import json
+            import csv
+            import sys
+
+            log_path = Path(args.log_file)
+            results = query_audit_log(
+                log_path=log_path,
+                from_time=getattr(args, 'from_time', None),
+                to_time=getattr(args, 'to_time', None),
+                level=args.level,
+                operation=args.operation,
+                serial=args.serial
+            )
+
+            if args.verify:
+                chain_path = log_path.parent / 'chain.dat'
+                valid, errors = verify_audit_log(log_path, chain_path)
+                if not valid:
+                    print("⚠️ Audit log integrity check FAILED!")
+                    for err in errors:
+                        print(f"  - {err}")
+                    sys.exit(1)
+                else:
+                    print("✓ Audit log integrity check PASSED")
+
+            if args.format == 'json':
+                print(json.dumps(results, indent=2))
+            elif args.format == 'csv':
+                if results:
+                    writer = csv.DictWriter(sys.stdout, fieldnames=results[0].keys())
+                    writer.writeheader()
+                    writer.writerows(results)
+            else:  # table
+                print(f"{'Timestamp':<30} {'Operation':<20} {'Status':<10} {'Message':<50}")
+                print("-" * 110)
+                for r in results[:50]:  # limit to 50 for readability
+                    print(f"{r.get('timestamp', '')[:30]:<30} {r.get('operation', '')[:20]:<20} "
+                          f"{r.get('status', '')[:10]:<10} {r.get('message', '')[:50]:<50}")
+
+        elif args.command == 'audit' and args.audit_command == 'verify':
+            from .audit import verify_audit_log
+            log_path = Path(args.log_file)
+            chain_path = Path(args.chain_file)
+            valid, errors = verify_audit_log(log_path, chain_path)
+            if valid:
+                print("✓ Audit log integrity verification PASSED")
+            else:
+                print("❌ Audit log integrity verification FAILED")
+                for err in errors:
+                    print(f"  - {err}")
+                sys.exit(1)
+
+        elif args.command == 'compromise':
+            from .ca import compromise_certificate_cmd
+            compromise_certificate_cmd(args)
+
         else:
             parser.print_help()
             sys.exit(1)
