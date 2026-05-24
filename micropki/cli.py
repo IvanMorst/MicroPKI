@@ -8,9 +8,8 @@ from . import logger
 from . import ca
 from .database import init_db, list_certificates, get_certificate_by_serial
 from .repository import serve_repository
-
 from .audit import query_audit_log, verify_audit_log
-from .compromise import init_compromised_table
+
 
 def main():
     parser = argparse.ArgumentParser(description="MicroPKI - Minimal PKI", prog="micropki")
@@ -53,11 +52,12 @@ def main():
     ca_issue.add_argument('--out-dir', default='./pki/certs')
     ca_issue.add_argument('--validity-days', type=int, default=365)
     ca_issue.add_argument('--db-path', help='SQLite database path')
+    ca_issue.add_argument('--csr', help='Sign an external CSR instead of generating new key')
     ca_issue.add_argument('--log-file')
 
     # Sprint 3: db init
-    db_init = subparsers.add_parser('db', help='Database commands')
-    db_sub = db_init.add_subparsers(dest='db_command', required=True)
+    db_init_parser = subparsers.add_parser('db', help='Database commands')
+    db_sub = db_init_parser.add_subparsers(dest='db_command', required=True)
     db_init_cmd = db_sub.add_parser('init', help='Initialise database')
     db_init_cmd.add_argument('--db-path', default='./pki/micropki.db')
     db_init_cmd.add_argument('--force', action='store_true', help='Force reinitialisation')
@@ -85,10 +85,9 @@ def main():
     repo_serve_cmd.add_argument('--db-path', default='./pki/micropki.db')
     repo_serve_cmd.add_argument('--cert-dir', default='./pki/certs')
     repo_serve_cmd.add_argument('--crl-dir', default='./pki/crl')
-    repo_serve_cmd.add_argument('--log-file')
-
     repo_serve_cmd.add_argument('--rate-limit', type=float, default=0, help='Requests per second per IP')
     repo_serve_cmd.add_argument('--rate-burst', type=int, default=10, help='Burst allowance')
+    repo_serve_cmd.add_argument('--log-file')
 
     # Sprint 4: ca revoke
     ca_revoke = subparsers.add_parser('revoke', help='Revoke a certificate')
@@ -158,6 +157,7 @@ def main():
     client_parser = subparsers.add_parser('client', help='Client tools')
     client_sub = client_parser.add_subparsers(dest='client_command', required=True)
 
+    # gen-csr
     gen_csr = client_sub.add_parser('gen-csr', help='Generate private key and CSR')
     gen_csr.add_argument('--subject', required=True)
     gen_csr.add_argument('--key-type', choices=['rsa', 'ecc'], default='rsa')
@@ -167,6 +167,7 @@ def main():
     gen_csr.add_argument('--out-csr', default='./request.csr.pem')
     gen_csr.add_argument('--log-file')
 
+    # request-cert
     req_cert = client_sub.add_parser('request-cert', help='Submit CSR to CA')
     req_cert.add_argument('--csr', required=True)
     req_cert.add_argument('--template', required=True, choices=['server', 'client', 'code_signing'])
@@ -175,6 +176,7 @@ def main():
     req_cert.add_argument('--out-cert', default='./cert.pem')
     req_cert.add_argument('--log-file')
 
+    # validate
     validate = client_sub.add_parser('validate', help='Validate certificate chain')
     validate.add_argument('--cert', required=True)
     validate.add_argument('--untrusted', action='append')
@@ -185,6 +187,7 @@ def main():
     validate.add_argument('--validation-time', help='ISO timestamp for validation (testing)')
     validate.add_argument('--log-file')
 
+    # check-status
     check_status = client_sub.add_parser('check-status', help='Check revocation status')
     check_status.add_argument('--cert', required=True)
     check_status.add_argument('--ca-cert', required=True)
@@ -192,9 +195,9 @@ def main():
     check_status.add_argument('--ocsp-url')
     check_status.add_argument('--log-file')
 
-    # Sprint 7: audit query
-    audit_query = subparsers.add_parser('audit', help='Audit log commands')
-    audit_sub = audit_query.add_subparsers(dest='audit_command', required=True)
+    # Sprint 7: audit commands
+    audit_parser = subparsers.add_parser('audit', help='Audit log commands')
+    audit_sub = audit_parser.add_subparsers(dest='audit_command', required=True)
 
     audit_query_cmd = audit_sub.add_parser('query', help='Query audit log')
     audit_query_cmd.add_argument('--from', dest='from_time', help='Start timestamp (ISO 8601)')
@@ -214,14 +217,12 @@ def main():
     ca_compromise = subparsers.add_parser('compromise', help='Simulate key compromise')
     ca_compromise.add_argument('--cert', required=True, help='Path to certificate')
     ca_compromise.add_argument('--reason', default='keyCompromise',
-                               choices=['keyCompromise', 'cACompromise', 'affiliationChanged',
-                                        'superseded', 'cessationOfOperation', 'certificateHold',
-                                        'privilegeWithdrawn', 'aACompromise'])
+                              choices=['keyCompromise', 'cACompromise', 'affiliationChanged',
+                                      'superseded', 'cessationOfOperation', 'certificateHold',
+                                      'privilegeWithdrawn', 'aACompromise'])
     ca_compromise.add_argument('--force', action='store_true', help='Skip confirmation')
     ca_compromise.add_argument('--log-file')
 
-    # Добавить --csr флаг к существующему issue-cert
-    ca_issue.add_argument('--csr', help='Sign an external CSR instead of generating new key')
     args = parser.parse_args()
     log_file = getattr(args, 'log_file', None)
     logger.setup_logger(log_file)
@@ -231,33 +232,59 @@ def main():
         if args.command == 'init':
             _validate_init_args(args)
             ca.init_ca(args)
+
         elif args.command == 'issue-intermediate':
             _validate_intermediate_args(args)
             ca.issue_intermediate(args)
+
         elif args.command == 'issue-cert':
             _validate_issue_args(args)
             ca.issue_certificate(args)
+
         elif args.command == 'db' and args.db_command == 'init':
             db_path = Path(args.db_path)
             init_db(db_path, force=args.force)
             print(f"Database initialised at {db_path}")
+
         elif args.command == 'list-certs':
             _do_list_certs(args)
+
         elif args.command == 'show-cert':
             _do_show_cert(args)
+
         elif args.command == 'repo' and args.repo_command == 'serve':
-            serve_repository(args.host, args.port, args.db_path, args.cert_dir, args.crl_dir,
-                             rate_limit=args.rate_limit, rate_burst=args.rate_burst)
+            serve_repository(
+                args.host, args.port, args.db_path, args.cert_dir, args.crl_dir,
+                rate_limit=args.rate_limit, rate_burst=args.rate_burst
+            )
+
         elif args.command == 'revoke':
             ca.revoke_certificate_cmd(args)
+
         elif args.command == 'gen-crl':
             ca.generate_crl_cmd(args)
+
         elif args.command == 'check-revoked':
             _do_check_revoked(args)
+
         elif args.command == 'validate-chain':
             _do_validate_chain(args)
+
         elif args.command == 'issue-ocsp-cert':
             ca.issue_ocsp_cert(args)
+
+        elif args.command == 'ocsp' and args.ocsp_command == 'serve':
+            from .ocsp_responder import serve_ocsp
+            serve_ocsp(
+                host=args.host,
+                port=args.port,
+                db_path=Path(args.db_path),
+                responder_cert_path=Path(args.responder_cert),
+                responder_key_path=Path(args.responder_key),
+                ca_cert_path=Path(args.ca_cert),
+                cache_ttl=args.cache_ttl
+            )
+
         elif args.command == 'client':
             if args.client_command == 'gen-csr':
                 from .client import client_gen_csr
@@ -271,82 +298,23 @@ def main():
             elif args.client_command == 'check-status':
                 from .client import client_check_status
                 client_check_status(args)
-        elif args.command == 'ocsp' and args.ocsp_command == 'serve':
-            from .ocsp_responder import serve_ocsp
-            serve_ocsp(
-                host=args.host,
-                port=args.port,
-                db_path=Path(args.db_path),
-                responder_cert_path=Path(args.responder_cert),
-                responder_key_path=Path(args.responder_key),
-                ca_cert_path=Path(args.ca_cert),
-                cache_ttl=args.cache_ttl
-            )
 
-        elif args.command == 'audit' and args.audit_command == 'query':
-            from .audit import query_audit_log, verify_audit_log
-            import json
-            import csv
-            import sys
-
-            log_path = Path(args.log_file)
-            results = query_audit_log(
-                log_path=log_path,
-                from_time=getattr(args, 'from_time', None),
-                to_time=getattr(args, 'to_time', None),
-                level=args.level,
-                operation=args.operation,
-                serial=args.serial
-            )
-
-            if args.verify:
-                chain_path = log_path.parent / 'chain.dat'
-                valid, errors = verify_audit_log(log_path, chain_path)
-                if not valid:
-                    print("⚠️ Audit log integrity check FAILED!")
-                    for err in errors:
-                        print(f"  - {err}")
-                    sys.exit(1)
-                else:
-                    print("✓ Audit log integrity check PASSED")
-
-            if args.format == 'json':
-                print(json.dumps(results, indent=2))
-            elif args.format == 'csv':
-                if results:
-                    writer = csv.DictWriter(sys.stdout, fieldnames=results[0].keys())
-                    writer.writeheader()
-                    writer.writerows(results)
-            else:  # table
-                print(f"{'Timestamp':<30} {'Operation':<20} {'Status':<10} {'Message':<50}")
-                print("-" * 110)
-                for r in results[:50]:  # limit to 50 for readability
-                    print(f"{r.get('timestamp', '')[:30]:<30} {r.get('operation', '')[:20]:<20} "
-                          f"{r.get('status', '')[:10]:<10} {r.get('message', '')[:50]:<50}")
-
-        elif args.command == 'audit' and args.audit_command == 'verify':
-            from .audit import verify_audit_log
-            log_path = Path(args.log_file)
-            chain_path = Path(args.chain_file)
-            valid, errors = verify_audit_log(log_path, chain_path)
-            if valid:
-                print("✓ Audit log integrity verification PASSED")
-            else:
-                print("❌ Audit log integrity verification FAILED")
-                for err in errors:
-                    print(f"  - {err}")
-                sys.exit(1)
+        elif args.command == 'audit':
+            if args.audit_command == 'query':
+                _do_audit_query(args)
+            elif args.audit_command == 'verify':
+                _do_audit_verify(args)
 
         elif args.command == 'compromise':
-            from .ca import compromise_certificate_cmd
-            compromise_certificate_cmd(args)
+            ca.compromise_certificate_cmd(args)
 
         else:
             parser.print_help()
-            sys.exit(1)
+            raise SystemExit(1)
+
     except Exception as e:
         log.exception("Command failed")
-        sys.exit(1)
+        raise SystemExit(1)
 
 
 def _validate_init_args(args):
@@ -384,8 +352,10 @@ def _do_list_certs(args):
     db_path = Path(args.db_path)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
-        sys.exit(1)
+        raise SystemExit(1)
+
     certs = list_certificates(db_path, args.status)
+
     if args.format == 'table':
         print(f"{'Serial':<20} {'Subject':<40} {'Expiration':<25} {'Status':<10}")
         print("-" * 95)
@@ -405,24 +375,29 @@ def _do_show_cert(args):
     db_path = Path(args.db_path)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
-        sys.exit(1)
+        raise SystemExit(1)
+
     cert_data = get_certificate_by_serial(db_path, args.serial)
     if not cert_data:
         print(f"Certificate with serial {args.serial} not found")
-        sys.exit(1)
+        raise SystemExit(1)
+
     print(cert_data['cert_pem'])
 
 
 def _do_check_revoked(args):
-    from .revocation import validate_reason
+    from .revocation import validate_reason  # noqa
+
     db_path = Path(args.db_path)
     if not db_path.exists():
         print(f"Database not found: {db_path}")
-        sys.exit(1)
+        raise SystemExit(1)
+
     cert_data = get_certificate_by_serial(db_path, args.serial)
     if not cert_data:
         print(f"Certificate with serial {args.serial} not found")
-        sys.exit(1)
+        raise SystemExit(1)
+
     if cert_data['status'] == 'revoked':
         print(f"REVOKED - Reason: {cert_data['revocation_reason']}, Date: {cert_data['revocation_date']}")
     else:
@@ -431,22 +406,79 @@ def _do_check_revoked(args):
 
 def _do_validate_chain(args):
     from cryptography import x509
-    from . import chain
+    from .chain import validate_chain, print_chain_info
 
-    leaf = x509.load_pem_x509_certificate(Path(args.leaf).read_bytes())
-    root = x509.load_pem_x509_certificate(Path(args.root).read_bytes())
+    leaf_cert = x509.load_pem_x509_certificate(Path(args.leaf).read_bytes())
+    root_cert = x509.load_pem_x509_certificate(Path(args.root).read_bytes())
+
     intermediates = []
     if args.intermediate:
         for int_path in args.intermediate:
             cert = x509.load_pem_x509_certificate(Path(int_path).read_bytes())
             intermediates.append(cert)
 
-    if chain.validate_chain(leaf, intermediates, root):
+    if validate_chain(leaf_cert, intermediates, root_cert):
         print("Chain validation: SUCCESS")
-        chain.print_chain_info(leaf, intermediates, root)
+        print_chain_info(leaf_cert, intermediates, root_cert)
     else:
         print("Chain validation: FAILED")
-        sys.exit(1)
+        raise SystemExit(1)
+
+
+def _do_audit_query(args):
+    import json
+    import csv
+    import sys as sys_module
+
+    log_path = Path(args.log_file)
+    results = query_audit_log(
+        log_path=log_path,
+        from_time=getattr(args, 'from_time', None),
+        to_time=getattr(args, 'to_time', None),
+        level=args.level,
+        operation=args.operation,
+        serial=args.serial
+    )
+
+    if args.verify:
+        chain_path = log_path.parent / 'chain.dat'
+        valid, errors = verify_audit_log(log_path, chain_path)
+        if not valid:
+            print("⚠️ Audit log integrity check FAILED!")
+            for err in errors:
+                print(f"  - {err}")
+            raise SystemExit(1)
+        else:
+            print("✓ Audit log integrity check PASSED")
+        print("")
+
+    if args.format == 'json':
+        print(json.dumps(results, indent=2))
+    elif args.format == 'csv':
+        if results:
+            writer = csv.DictWriter(sys_module.stdout, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+    else:  # table
+        print(f"{'Timestamp':<30} {'Operation':<20} {'Status':<10} {'Message':<50}")
+        print("-" * 110)
+        for r in results[:50]:
+            print(f"{r.get('timestamp', '')[:30]:<30} {r.get('operation', '')[:20]:<20} "
+                  f"{r.get('status', '')[:10]:<10} {r.get('message', '')[:50]:<50}")
+
+
+def _do_audit_verify(args):
+    log_path = Path(args.log_file)
+    chain_path = Path(args.chain_file)
+    valid, errors = verify_audit_log(log_path, chain_path)
+
+    if valid:
+        print("✓ Audit log integrity verification PASSED")
+    else:
+        print("❌ Audit log integrity verification FAILED")
+        for err in errors:
+            print(f"  - {err}")
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

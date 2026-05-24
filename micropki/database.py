@@ -91,9 +91,13 @@ def insert_certificate(db_path: Path, cert_data: Dict[str, Any]):
 
 def get_certificate_by_serial(db_path: Path, serial_hex: str) -> Optional[Dict[str, Any]]:
     """Retrieve certificate record by serial number (hex string)."""
+    # Нормализация: удаляем ведущие нули
+    normalized = serial_hex.lstrip('0')
+    if not normalized:
+        normalized = '0'
     conn = get_db_connection(db_path)
     try:
-        cursor = conn.execute("SELECT * FROM certificates WHERE serial_hex = ?", (serial_hex.upper(),))
+        cursor = conn.execute("SELECT * FROM certificates WHERE serial_hex = ?", (normalized,))
         row = cursor.fetchone()
         if row:
             columns = [desc[0] for desc in cursor.description]

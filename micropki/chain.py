@@ -113,8 +113,8 @@ def validate_chain(
         return dt
 
     for cert in all_certs + [root_cert]:
-        not_before = normalize_datetime(cert.not_valid_before)
-        not_after = normalize_datetime(cert.not_valid_after)
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
         if now < not_before or now > not_after:
             logger_local.error(f"Certificate is not valid")
             return False

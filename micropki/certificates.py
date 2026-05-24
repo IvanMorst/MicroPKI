@@ -36,6 +36,8 @@ def _attr_key_to_oid(key: str) -> x509.ObjectIdentifier:
         'STREET': NameOID.STREET_ADDRESS,
         'DC': NameOID.DOMAIN_COMPONENT,
         'UID': NameOID.USER_ID,
+        'EMAIL': NameOID.EMAIL_ADDRESS,
+        'E': NameOID.EMAIL_ADDRESS,
     }
     oid = mapping.get(key.upper())
     if oid is None:
