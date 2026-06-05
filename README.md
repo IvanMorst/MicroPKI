@@ -163,6 +163,12 @@ make test
 
 # Запуск сервера
 make server
+
+# Запуск coverage
+make coverage
+
+# Запуск performance тестов
+make perf-test
 ```
 
 ## Использование
@@ -592,6 +598,11 @@ pip install pytest
 ```bash
 
 pytest tests/ -v
+
+```
+### Запуск тестов с покрытием
+```bash
+pytest tests/ -v --cov=micropki --cov-report=term --cov-report=html
 ```
 ## Запуск конкретного тестового файла
 ```bash
