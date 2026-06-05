@@ -36,4 +36,7 @@ def load_passphrase(passphrase_file: Path) -> bytes:
 def load_encrypted_private_key(key_path: Path, passphrase: bytes) -> PrivateKeyTypes:
     """Load encrypted private key from PEM file."""
     key_data = key_path.read_bytes()
+    # Если passphrase is None, значит ключ не зашифрован
+    if passphrase is None:
+        return load_pem_private_key(key_data, password=None)
     return load_pem_private_key(key_data, password=passphrase)

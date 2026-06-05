@@ -1,0 +1,32 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --strict-markers"
+markers = [
+    "slow: marks tests as slow (performance tests)",
+]
+
+[tool.coverage.run]
+source = ["micropki"]
+omit = [
+    "tests/*",
+    "micropki/__init__.py",
+    "micropki/ocsp_responder.py",
+    "micropki/revocation_check.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if __name__ == .__main__.:",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if TYPE_CHECKING:",
+]
+fail_under = 47
+show_missing = true
