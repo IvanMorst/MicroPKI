@@ -69,6 +69,10 @@ def generate_crl(
     """Generate a CRL for a CA."""
     from .crypto_utils import load_encrypted_private_key
 
+    # Convert output_path to Path if it's a string
+    if isinstance(output_path, str):
+        output_path = Path(output_path)
+
     # Load CA certificate and key
     ca_cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
     ca_key = load_encrypted_private_key(ca_key_path, ca_passphrase)

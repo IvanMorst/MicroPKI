@@ -27,6 +27,7 @@ def build_chain(leaf: x509.Certificate, intermediates: List[x509.Certificate],
     Returns list [leaf, intermediate1, ..., root] or None if no chain found.
     """
     possible_issuers = intermediates + roots
+    possible_issuers.extend(roots)
 
     def find_issuer(cert: x509.Certificate, candidates: List[x509.Certificate]) -> Optional[x509.Certificate]:
         for issuer in candidates:

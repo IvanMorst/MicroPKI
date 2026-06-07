@@ -1,13 +1,14 @@
+# micropki/revocation_check.py - исправленная версия
 import logging
 import requests
 from datetime import datetime, timezone
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.ocsp import OCSPRequestBuilder, OCSPResponseStatus
 from cryptography.x509.oid import ExtensionOID, AuthorityInformationAccessOID
 
-from .chain import verify_signature, verify_crl_signature
+from .chain import verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ def get_ocsp_uri(cert: x509.Certificate) -> Optional[str]:
     return None
 
 
-def get_crl_uris(cert: x509.Certificate) -> List[str]:
+def get_crl_uris(cert: x509.Certificate) -> list:
     """Extract CRL distribution point URIs from CDP extension."""
     uris = []
     try:
@@ -49,16 +50,25 @@ def check_ocsp(cert: x509.Certificate, issuer: x509.Certificate, ocsp_url: Optio
         if ocsp_url is None:
             return 'error', "No OCSP URL found in certificate"
 
+    # Build OCSP request
     builder = OCSPRequestBuilder()
     builder = builder.add_certificate(cert, issuer, hashes.SHA1())
+
+    # Nonce functionality is optional, skip if not available in this cryptography version
     if nonce:
-        import os
-        from cryptography.x509.ocsp import OCSPNonce
-        nonce_value = os.urandom(16)
-        builder = builder.add_extension(OCSPNonce(nonce_value), critical=False)
+        try:
+            import os
+            # Try to import OCSPNonce (may not be available in older versions)
+            from cryptography.x509.ocsp import OCSPNonce
+            nonce_value = os.urandom(16)
+            builder = builder.add_extension(OCSPNonce(nonce_value), critical=False)
+        except ImportError:
+            logger.debug("OCSPNonce not available in this cryptography version, skipping")
+
     request = builder.build()
     request_der = request.public_bytes(serialization.Encoding.DER)
 
+    # Send request
     try:
         response = requests.post(ocsp_url, data=request_der, headers={'Content-Type': 'application/ocsp-request'},
                                  timeout=10)
@@ -67,6 +77,7 @@ def check_ocsp(cert: x509.Certificate, issuer: x509.Certificate, ocsp_url: Optio
     except Exception as e:
         return 'error', f"Network error: {e}"
 
+    # Parse response
     try:
         from cryptography.x509 import load_der_ocsp_response
         ocsp_resp = load_der_ocsp_response(response.content)
@@ -112,6 +123,7 @@ def check_crl(cert: x509.Certificate, issuer: x509.Certificate, crl_data: Option
         except Exception as e:
             return 'error', f"CRL fetch error: {e}"
 
+    # Parse CRL
     try:
         if crl_data.startswith(b'-----BEGIN'):
             crl = x509.load_pem_x509_crl(crl_data)
@@ -122,8 +134,7 @@ def check_crl(cert: x509.Certificate, issuer: x509.Certificate, crl_data: Option
 
     if crl.issuer != issuer.subject:
         return 'error', "CRL issuer does not match certificate issuer"
-
-    if not verify_crl_signature(crl, issuer):
+    if not verify_signature(crl, issuer):
         return 'error', "CRL signature invalid"
 
     now = datetime.now(timezone.utc)
@@ -139,7 +150,7 @@ def check_crl(cert: x509.Certificate, issuer: x509.Certificate, crl_data: Option
             reason = "unspecified"
             try:
                 reason_ext = revoked.extensions.get_extension_for_oid(ExtensionOID.CRL_REASON)
-                reason = str(reason_ext.value)
+                reason = reason_ext.value.dotted_string
             except x509.ExtensionNotFound:
                 pass
             return 'revoked', f"Serial {hex(serial)} found in CRL, reason: {reason}"

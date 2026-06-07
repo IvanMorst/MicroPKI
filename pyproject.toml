@@ -18,6 +18,8 @@ omit = [
 ]
 
 [tool.coverage.report]
+fail_under = 80
+show_missing = true
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",
@@ -28,5 +30,3 @@ exclude_lines = [
     "if 0:",
     "if TYPE_CHECKING:",
 ]
-fail_under = 47
-show_missing = true

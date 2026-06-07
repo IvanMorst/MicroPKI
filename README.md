@@ -632,3 +632,7 @@ micropki init --subject "/CN=Test" --passphrase-file ./nonexistent.pass
 
 ```
  Ожидается: Validation error: Passphrase file does not exist
+
+
+[![CI](https://github.com/IvanMorst/MicroPKI/actions/workflows/ci.yml/badge.svg)](https://github.com/IvanMorst/MicroPKI/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/IvanMorst/MicroPKI/branch/main/graph/badge.svg)](https://codecov.io/gh/IvanMorst/MicroPKI)
